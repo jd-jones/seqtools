@@ -6,6 +6,8 @@ is subject to change without notice.
 
 ## Installation
 Clone this repo and then install it with pip. Installation will go about 5 minutes without printing anything at some point, while it is installing `mfst`.
+
+**NOTE:** I've tried installing ``mfst`` on OSX, but it crashes because of some problem with LLVM (I think).
 ``` console
 user@host:~$ pip install -e /PATH/TO/seqtools/
 ```
