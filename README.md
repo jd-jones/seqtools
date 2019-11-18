@@ -6,12 +6,11 @@ is subject to change without notice.
 
 ## Installation
 ``` console
-user@host:~/repo/zero-shot$ pip install -r requirements.txt
-user@host:~/repo/zero-shot$ python setup.py install
+user@host:~$ pip install -e /PATH/TO/seqtools/
 ```
 
 ## Usage
-See `tests` for usage examples.
+See `tests` for usage examples (but there are none right now).
 
 [pytorch-struct]: https://github.com/harvardnlp/pytorch-struct
 [mfst]: https://github.com/matthewfl/openfst-wrapper
