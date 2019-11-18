@@ -5,6 +5,7 @@ Utilities for structured prediction of sequences, built on [pytorch-struct] and 
 is subject to change without notice.
 
 ## Installation
+Clone this repo and then install it with pip. Installation will go about 5 minutes without printing anything at some point, while it is installing `mfst`.
 ``` console
 user@host:~$ pip install -e /PATH/TO/seqtools/
 ```
