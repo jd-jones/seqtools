@@ -1,0 +1,4 @@
+[flake8]
+ignore = E231, W605, W503
+exclude = .git
+max-line-length = 100
