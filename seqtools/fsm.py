@@ -12,32 +12,6 @@ from ._fsm_utils.expectation_semiring import ExpectationSemiringWeight
 logger = logging.getLogger(__name__)
 
 
-def sum_paths_fb(fst):
-    """ Use forward-backward to find the pathsum of an FST in the expectation semiring. """
-
-    assert fst.semiring is ExpectationSemiringWeight
-
-    fst_real = fst.lift(ExpectationSemiringWeight, converter=lambda w: w.dropvalue())
-    alpha = fst_real.shortest_distance()
-    beta = fst_real.shortest_distance(reverse=True)
-    Z = beta[fst_real.initial_state]
-
-    total = ExpectationSemiringWeight(0)
-    for s in fst.states:
-        # if s is final, then get_arcs will yield an arc to state -1 with the final-state weight
-        for e in fst.get_arcs(s):
-            multiplier = alpha[s] * (
-                beta[e.nextstate] if e.nextstate >= 0 else ExpectationSemiringWeight.one
-            )
-            # avoid multiplying the big `e.weight` by alpha and beta separately
-            total += multiplier * e.weight
-
-    # The second element of total will now be correct, but we need to replace
-    # the first element with Z. Here's a slightly hacky approach that remains
-    # safe (even if total and Z are encoded with different multipliers).
-    return total + (Z.dropvalue() - total.dropvalue())
-
-
 class FST(mfst.FST):
     EXPECTATION_USES_FB = False
 
@@ -71,9 +45,34 @@ class FST(mfst.FST):
         )
         return type(self)(**params)
 
+    def sum_paths_fb(self):
+        """ Use forward-backward to find the pathsum of an FST in the expectation semiring. """
+
+        assert self.semiring is ExpectationSemiringWeight
+
+        self_real = self.lift(ExpectationSemiringWeight, converter=lambda w: w.dropvalue())
+        alpha = self_real.shortest_distance()
+        beta = self_real.shortest_distance(reverse=True)
+        Z = beta[self_real.initial_state]
+
+        total = ExpectationSemiringWeight(0)
+        for s in self.states:
+            # if s is final, then get_arcs will yield an arc to state -1 with the final-state weight
+            for e in self.get_arcs(s):
+                multiplier = alpha[s] * (
+                    beta[e.nextstate] if e.nextstate >= 0 else ExpectationSemiringWeight.one
+                )
+                # avoid multiplying the big `e.weight` by alpha and beta separately
+                total += multiplier * e.weight
+
+        # The second element of total will now be correct, but we need to replace
+        # the first element with Z. Here's a slightly hacky approach that remains
+        # safe (even if total and Z are encoded with different multipliers).
+        return total + (Z.dropvalue() - total.dropvalue())
+
     def sum_paths_with_fb(self, *args, **kwargs):
         if self.expectation_uses_fb and self.semiring is ExpectationSemiringWeight:
-            return sum_paths_fb(self, *args, **kwargs)
+            return self.sum_paths_fb(*args, **kwargs)
         else:
             return self._sum_paths(*args, **kwargs)
 
@@ -460,7 +459,6 @@ def leftToRightAcceptor(input_seq, semiring=None, string_mapper=None):
 
     acceptor = FST(semiring, string_mapper=string_mapper, acceptor=True)
     init_state = acceptor.add_state()
-    # acceptor.add_arc(init_state, init_state, input_label=input_seq[0], weight=semiring.one)
     acceptor.set_initial_state(init_state)
 
     prev_state = init_state
