@@ -1,11 +1,13 @@
 import collections
 import logging
 import math
+import itertools
 
 import graphviz
+import torch
 
 import mfst
-from . import semirings
+from . import semirings, utils
 from ._fsm_utils.expectation_semiring import ExpectationSemiringWeight
 
 
@@ -17,7 +19,7 @@ class FST(mfst.FST):
 
     def __init__(
             self, *args,
-            display_dir='TB', float_precision=None, expectation_uses_fb=None,
+            display_dir='LR', float_precision=None, expectation_uses_fb=None,
             **kwargs):
         self.display_dir = display_dir
         self.float_precision = float_precision
@@ -153,7 +155,8 @@ class FST(mfst.FST):
                     else:
                         return chr(x)
             else:
-                make_label = self._string_mapper
+                def make_label(x):
+                    return str(self._string_mapper(x))
         else:
             make_label = str
 
@@ -221,6 +224,267 @@ class FST(mfst.FST):
         fst = self.toGraphviz()
 
         return fst._repr_svg_()
+
+
+class FstIntegerizer(object):
+    def __init__(self, iterable=[]):
+        # OpenFST hardcodes zero to represent epsilon transitions---so make sure
+        # our integerizer is consistent with that.
+        super().__init__(['epsilon'])
+        self.update(iterable)
+
+    def updateFromSequences(self, sequences):
+        self.update(itertools.chain(*sequences))
+
+    def integerizeSequence(self, sequence):
+        return tuple(self.index(x) for x in sequence)
+
+
+class HashableFstIntegerizer(FstIntegerizer, utils.Integerizer):
+    pass
+
+
+class UnhashableFstIntegerizer(FstIntegerizer, utils.UnhashableIntegerizer):
+    pass
+
+
+def fstNLLLoss(decode_graphs, label_seqs):
+    """ Compute structured negative-log-likelihood loss using FST methods.
+
+    NOTE: Right now this library handles mini-batches by iterating over each
+        item in the batch, so batch operations are not vectorized.
+
+    Parameters
+    ----------
+    decode_graphs : iterable(fsm.FST)
+    label_seqs : torch.Tensor of int, shape (batch_size, num_samples)
+
+    Returns
+    -------
+    loss : float
+    """
+
+    def generateLosses(decode_graphs, label_seqs):
+        for decode_graph, label_seq in zip(decode_graphs, label_seqs):
+            # FIXME: We need a more consistent way of mapping to/from the arc labels
+            gt_path_acceptor = FST(decode_graph.semiring).create_from_string(label_seq + 1)
+            gt_path_score = decode_graph.compose(gt_path_acceptor).sum_paths().value
+            total_path_score = decode_graph.sum_paths().value
+
+            if decode_graph.semiring is semirings.LogSemiringWeight:
+                yield -(gt_path_score - total_path_score)
+            elif decode_graph.semiring is semirings.RealSemiringWeight:
+                yield -(torch.log(gt_path_score) - torch.log(total_path_score))
+            elif decode_graph.semiring is semirings.TropicalSemiringWeight:
+                yield gt_path_score - total_path_score
+            else:
+                raise AssertionError(f"{decode_graph.semiring} is not supported by fstNLLLoss")
+
+    return torch.stack(tuple(generateLosses(decode_graphs, label_seqs)))
+
+
+class FstScorer(object):
+    """ Modify arbitrary data scores using a sequence model implemented as an FST.
+
+    You can use this mixin class to easily make a BiLSTM-CRF, for example.
+
+    Attributes
+    ----------
+    """
+
+    def __init__(
+            self, transition_weights, *super_args,
+            init_weights=None, final_weights=None, semiring=None, requires_grad=False,
+            forward_uses_max=False,
+            integerizer=None, vocabulary=None, device=None,
+            **super_kwargs):
+        """
+        Parameters
+        ----------
+        """
+
+        super().__init__(*super_args, **super_kwargs)
+
+        if vocabulary is None:
+            vocabulary = tuple(range(transition_weights.shape[0]))
+
+        if integerizer is None:
+            integerizer = HashableFstIntegerizer(vocabulary)
+
+        if semiring is None:
+            semiring = semirings.LogSemiringWeight
+
+        if final_weights is None:
+            final_weights = torch.full(transition_weights.shape[0:1], semiring.one.value)
+
+        if init_weights is None:
+            init_weights = torch.full(transition_weights.shape[0:1], semiring.one.value)
+
+        self.vocabulary = vocabulary
+
+        self.integerizer = integerizer
+
+        self.semiring = semiring
+
+        self.forward_uses_max = forward_uses_max
+
+        self.device = device
+
+        # Register semiring zero and one elements so they will be on the same
+        # as the model's params
+        self._semiring_zero = torch.nn.Parameter(
+            self.semiring.zero.value.to(device),
+            requires_grad=False
+        )
+        self._semiring_one = torch.nn.Parameter(
+            self.semiring.one.value.to(device),
+            requires_grad=False
+        )
+        self.semiring.zero = self.semiring(self._semiring_zero)
+        self.semiring.one = self.semiring(self._semiring_one)
+
+        self.transition_weights = torch.nn.Parameter(
+            transition_weights.to(device), requires_grad=requires_grad
+        )
+        self.init_weights = torch.nn.Parameter(
+            init_weights.to(device), requires_grad=requires_grad
+        )
+        self.final_weights = torch.nn.Parameter(
+            final_weights.to(device), requires_grad=requires_grad
+        )
+
+        self.label_scorer = fromTransitions(
+            self.transition_weights, self.init_weights, self.final_weights, self.mapper,
+            semiring=self.semiring
+        )
+
+        self._label_scorer_tropical_sr = None
+
+    def mapper(self, obj):
+        index = self.integerizer.index(obj)
+
+        if index is None:
+            raise KeyError()
+
+        return index
+
+    @property
+    def label_scorer_tropical_sr(self):
+        if self._label_scorer_tropical_sr is None:
+            self._label_scorer_tropical_sr = self.label_scorer.lift(
+                semiring=semirings.TropicalSemiringWeight, converter=lambda x: -(x.value)
+            )
+
+        return self._label_scorer_tropical_sr
+
+    def forward(self, batch, use_tropical_semiring=None):
+        # Predict all data scores in batch mode
+        batch_data_scores = super().forward(batch)
+
+        if use_tropical_semiring is None:
+            use_tropical_semiring = self.forward_uses_max
+
+        if use_tropical_semiring:
+            label_scorer = self.label_scorer_tropical_sr
+            semiring = semirings.TropicalSemiringWeight
+            # semiring.zero = semiring(torch.tensor(float(semiring.zero.value), device=self.device))
+            # semiring.one = semiring(torch.tensor(float(semiring.one.value), device=self.device).float())
+            batch_data_scores = -batch_data_scores
+        else:
+            label_scorer = self.label_scorer
+            semiring = self.semiring
+
+        # Construct decode graphs sequence-by-sequence
+        decode_graphs = tuple(
+            fromArray(
+                data_scores, semiring=semiring,
+                input_labels=tuple(range(1, data_scores.shape[1] + 1)),
+                output_labels=tuple(self.mapper(x) for x in self.vocabulary)
+            ).compose(label_scorer)
+            for data_scores in batch_data_scores
+        )
+        return decode_graphs
+
+    def predict(self, decode_graphs):
+        x = tuple(
+            torch.tensor(argmax(decode_graph, count=1)) - 1
+            for decode_graph in decode_graphs
+        )
+
+        return x
+
+
+def argmax(decode_graph, count=1, squeeze=True):
+    if decode_graph.semiring is not semirings.TropicalSemiringWeight:
+        if decode_graph.semiring is semirings.LogSemiringWeight:
+            def converter(weight):
+                return -weight.value
+        elif decode_graph.semiring is semirings.RealSemiringWeight:
+            def converter(weight):
+                return -weight.value.log()
+        else:
+            raise NotImplementedError("Conversion to tropical semiring isn't implemented yet")
+        decode_graph = decode_graph.lift(
+            semiring=semirings.TropicalSemiringWeight, converter=converter
+        )
+
+    lattice = decode_graph.shortest_path(count=count)
+    best_paths = tuple(path.output_path for path in lattice.iterate_paths())
+
+    if squeeze and len(best_paths) == 1:
+        return best_paths[0]
+
+    return best_paths
+
+
+class AbstractFstSequenceModel(object):
+    def __init__(self, *args, **kwargs):
+        self._process_fst = None
+        self._integerizer = None
+        self._initialize(*args, **kwargs)
+
+    def fit(
+            self, label_seqs, *feat_seqs, process_only=False, observation_only=False,
+            **super_kwargs):
+
+        if not process_only:
+            self._fitObservationModel(label_seqs, *feat_seqs)
+            label_seqs = self._preprocessLabelSeqs(label_seqs)
+            self._integerizer.updateFromSequences(label_seqs)
+
+        if not observation_only:
+            self._process_fst = self._fitProcessModel(label_seqs)
+
+    def score(self, *feat_seqs):
+        observation_scores = self._scoreObservations(*feat_seqs)
+        scores = observation_scores.compose(self._process_fst)
+        return scores
+
+    def predictSeq(self, *feat_seqs):
+        score_lattice = self.score(*feat_seqs)
+        shortest_path = score_lattice.shortest_path()
+        predictions = shortest_path.get_unique_output_string()
+        return predictions
+
+    @property
+    def num_states(self):
+        # FIXME
+        return None
+
+    def _initialize(self):
+        raise NotImplementedError
+
+    def _fitIntegerizer(self, *label_seqs):
+        raise NotImplementedError
+
+    def _fitObservationModel(self, *feat_seqs):
+        raise NotImplementedError
+
+    def _fitProcessModel(self, *feat_seqs):
+        raise NotImplementedError
+
+    def _scoreObservations(self, *feat_seqs):
+        raise NotImplementedError
 
 
 def traverse(fst):
@@ -375,7 +639,7 @@ def fromArray(
     """
 
     if semiring is None:
-        semiring = semirings.BooleanSemiringWeight
+        semiring = semirings.LogSemiringWeight
 
     if final_weight is None:
         final_weight = semiring.one
@@ -402,10 +666,11 @@ def fromArray(
         for sample_index, row in enumerate(weights):
             cur_state = fst.add_state()
             for i, weight in enumerate(row):
-                fst.add_arc(
-                    prev_state, cur_state, input_label=input_labels[i],
-                    weight=weight
-                )
+                if semiring(weight) != semiring.zero:
+                    fst.add_arc(
+                        prev_state, cur_state, input_label=input_labels[i],
+                        weight=weight
+                    )
             prev_state = cur_state
         fst.set_final_weight(cur_state, final_weight)
     else:
@@ -414,15 +679,79 @@ def fromArray(
             cur_state = fst.add_state()
             for i, outputs in enumerate(input_output):
                 for j, weight in enumerate(outputs):
-                    fst.add_arc(
-                        prev_state, cur_state,
-                        input_label=input_labels[i], output_label=output_labels[j],
-                        weight=weight
-                    )
+                    if semiring(weight) != semiring.zero:
+                        fst.add_arc(
+                            prev_state, cur_state,
+                            input_label=input_labels[i], output_label=output_labels[j],
+                            weight=weight
+                        )
             prev_state = cur_state
         fst.set_final_weight(cur_state, final_weight)
 
     fst.display_dir = 'LR'
+
+    return fst
+
+
+def fromTransitions(
+        transition_weights, init_weights, final_weights, label_mapper,
+        semiring=None, as_dict=False):
+    """ Instantiate a state machine from state transitions.
+
+    Parameters
+    ----------
+
+    Returns
+    -------
+    """
+
+    if semiring is None:
+        semiring = semirings.LogSemiringWeight
+
+    if as_dict:
+        transitions = transition_weights.keys()
+        final_states = final_weights.keys()
+    else:
+        transitions = (transition_weights != semiring.zero.value).nonzero().tolist()
+        final_states = (final_weights != semiring.zero.value).nonzero().squeeze(1).tolist()
+        init_states = (init_weights != semiring.zero.value).nonzero().squeeze(1).tolist()
+
+    fst = FST(semiring)
+    init_state = fst.add_state()
+    fst.set_initial_state(init_state)
+
+    fst_states = {}
+    for (prev, cur) in transitions:
+        weight = transition_weights[prev, cur]
+
+        prev_state = fst_states.get(prev, None)
+        if prev_state is None:
+            prev_state = fst.add_state()
+            fst_states[prev] = prev_state
+
+        cur_state = fst_states.get(cur, None)
+        if cur_state is None:
+            cur_state = fst.add_state()
+            fst_states[cur] = cur_state
+
+        fst.add_arc(
+            prev_state, cur_state,
+            input_label=label_mapper(prev), output_label=label_mapper(cur),
+            weight=weight
+        )
+
+    for state in init_states:
+        weight = init_weights[state]
+        state_idx = fst_states[state]
+        fst.add_arc(
+            init_state, state_idx,
+            input_label=0, output_label=0, weight=weight
+        )
+
+    for state in final_states:
+        weight = final_weights[state]
+        state_idx = fst_states[state]
+        fst.set_final_weight(state_idx, weight)
 
     return fst
 

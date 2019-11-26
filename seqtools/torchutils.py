@@ -150,7 +150,7 @@ def fillSegments(pred_batch, in_place=False):
             pred_batch[sample_index, seg_start:next_seg_start] = seg_label
 
 
-def predictBatch(model, batch_input, device=None, as_numpy=False, structure=None):
+def predictBatch(model, batch_input, device=None, as_numpy=False):
     """ Use a model to make predictions from a minibatch of data.
 
     Parameters
@@ -164,9 +164,6 @@ def predictBatch(model, batch_input, device=None, as_numpy=False, structure=None
         Device to use when processing data with the model.
     as_numpy : bool, optional
         If True, return a numpy.array instead of torch.Tensor. False by default.
-    structure : torch_struct.StructDistribution, optional
-        If this argument is omitted, the function will try to choose a structure
-        that is compatible with the shape of the output of ``model.forward()``.
 
     Returns
     -------
@@ -178,26 +175,22 @@ def predictBatch(model, batch_input, device=None, as_numpy=False, structure=None
         particular hypothesis. Higher numbers are better.
     """
 
-    batch_input = batch_input.to(device=device)
-
-    outputs = model(batch_input)
-
-    if structure is None:
-        structure = guessStructure(outputs)
-
-    if structure is None:
-        __, preds = torch.max(outputs, 1)
+    if hasattr(model, 'predict'):
+        predict = model.predict
     else:
-        dist = structure(outputs)
-        preds, _ = dist.struct.from_parts(dist.argmax)
-        if (preds == -1).any():
-            fillSegments(preds, in_place=True)
-        # The first predicted label is spurious---it's the state from which the
-        # initial state transitioned.
-        preds = preds[:, 1:]
+        def predict(outputs):
+            __, preds = torch.max(outputs, 1)
+            return preds
+
+    batch_input = batch_input.to(device=device)
+    outputs = model(batch_input)
+    preds = predict(outputs)
 
     if as_numpy:
-        preds = preds.cpu().numpy()
+        try:
+            preds = preds.cpu().numpy()
+        except AttributeError:
+            preds = tuple(p.cpu().numpy() for p in preds)
         outputs = outputs.cpu().detach().numpy()
 
     return preds, outputs
@@ -300,8 +293,12 @@ def predictSamples(
                 batch_io = (preds,) + tuple(sample)
                 io_history.append(batch_io)
 
+            # FIXME: This will only count the first sequence in a minibatch
             if metrics:
-                preds = preds.cpu().numpy().squeeze()
+                try:
+                    preds = preds.cpu().numpy().squeeze()
+                except AttributeError:
+                    preds = tuple(p.cpu().numpy() for p in preds)[0]
                 labels = labels.cpu().numpy().squeeze()
 
             for key, value in metrics.items():
@@ -405,7 +402,10 @@ def trainModel(
     return model, last_model_wts
 
 
-def plotEpochLog(epoch_log, subfig_size=None, title=''):
+def plotEpochLog(epoch_log, subfig_size=None, title='', fn=None):
+    if subfig_size is None:
+        subfig_size = (12, 3)
+
     num_plots = len(epoch_log)
 
     figsize = subfig_size[0], subfig_size[1] * num_plots
@@ -418,6 +418,12 @@ def plotEpochLog(epoch_log, subfig_size=None, title=''):
     axes[0].set_title(title)
     axes[-1].set_xlabel('Epoch index')
     plt.tight_layout()
+
+    if fn is None:
+        plt.show()
+    else:
+        plt.savefig(fn)
+        plt.close()
 
 
 def makeTimeString(time_elapsed):
@@ -438,7 +444,9 @@ class SequenceDataset(Dataset):
     _device : torch.Device
     """
 
-    def __init__(self, data, labels, device=None, labels_type=None, sliding_window_args=None):
+    def __init__(
+            self, data, labels, device=None, labels_type=None, sliding_window_args=None,
+            transpose_data=False):
         """
         Parameters
         ----------
@@ -465,6 +473,7 @@ class SequenceDataset(Dataset):
             raise ValueError(err_str)
 
         self.sliding_window_args = sliding_window_args
+        self.transpose_data = transpose_data
 
         self._device = device
         self._labels_type = labels_type
@@ -492,12 +501,9 @@ class SequenceDataset(Dataset):
         if self._labels_type == 'float':
             label_seq = label_seq.float()
 
-        # Convert input from [0, 1] --> [-1, 1]
-        # FIXME: don't do this for every dataset---only JIGSAWS
-        # data_seq = 2 * (data_seq - 0.5)
-
         # shape (sequence_len, num_dims) --> (num_dims, sequence_len)
-        data_seq = data_seq.transpose(0, 1)
+        if self.transpose_data:
+            data_seq = data_seq.transpose(0, 1)
 
         if self.sliding_window_args is not None:
             # Unfold gives shape (sequence_len, window_len);
@@ -638,6 +644,16 @@ class SemiMarkovScorer(object):
             end_weights, requires_grad=update_transition_params
         )
         self.max_duration = max_duration
+
+    def predict(self, outputs):
+        dist = torch_struct.SemiMarkovCRF(outputs)
+        preds, _ = dist.struct.from_parts(dist.argmax)
+        if (preds == -1).any():
+            fillSegments(preds, in_place=True)
+        # The first predicted label is spurious---it's the state from which the
+        # initial state transitioned.
+        preds = preds[:, 1:]
+        return preds
 
     def forward(self, attribute_scores):
         """ Construct a table of semi-Markov (i.e. segmental) scores.

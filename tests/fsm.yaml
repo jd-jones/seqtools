@@ -1,0 +1,6 @@
+out_dir: '~/repo/seqtools/test_output/fsm'
+learning_rate: 0.001
+gpu_dev_id: '0'
+num_epochs: 50
+sample_size: 10
+random_seed: 0

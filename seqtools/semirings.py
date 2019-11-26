@@ -1,5 +1,4 @@
-import math
-from math import exp as _exp
+import torch
 
 import numpy as np
 from mfst import AbstractSemiringWeight
@@ -182,17 +181,23 @@ MaxPlusSemiringWeight.one = MaxPlusSemiringWeight(0)
 class TropicalSemiringWeight(MinPlusSemiringWeight):
 
     def sampling_weight(self):
-        return _exp(-self.value)
-
-
-class LogSemiringWeight(MaxPlusSemiringWeight):
-    def __add__(self, other):
-        raise NotImplementedError()
+        return torch.exp(-self.value)
 
 
 # static semiring zero and one elements
 TropicalSemiringWeight.zero = TropicalSemiringWeight(float('inf'))
 TropicalSemiringWeight.one = TropicalSemiringWeight(0)
+
+
+class LogSemiringWeight(MaxPlusSemiringWeight):
+    def __add__(self, other):
+        value = torch.logsumexp(torch.stack((self.value, other.value)), 0)
+        return self._create(value)
+
+
+# static semiring zero and one elements
+LogSemiringWeight.zero = LogSemiringWeight(torch.tensor(float('-inf')))
+LogSemiringWeight.one = LogSemiringWeight(torch.tensor(0, dtype=torch.float))
 
 
 class BooleanSemiringWeight(PythonValueSemiringWeight):
@@ -237,43 +242,3 @@ class BooleanSemiringWeight(PythonValueSemiringWeight):
 
 BooleanSemiringWeight.zero = BooleanSemiringWeight(False)
 BooleanSemiringWeight.one = BooleanSemiringWeight(True)
-
-
-# FROM SEQ2CLASS HW2; PROBABLY NOT NEEDED
-class TropicalSemiring(RealSemiringWeight):
-
-    # tell OpenFST that <= is a total order (the "path property")
-    semiring_properties = 'path'
-
-    # let self.value be the path length of this edge
-
-    def __init__(self, v):
-        super().__init__(v)  # sets self.value = v
-
-    def __add__(self, other):
-        # return a new instance of TropicalSemiring with value: self (+) other
-        result_value = min(self.value, other.value)
-        return TropicalSemiring(result_value)
-
-    def __mul__(self, other):
-        # self (*) other
-        result_value = self.value + other.value
-        return TropicalSemiring(result_value)
-
-    def __div__(self, other):
-        # self (/) other
-        result_value = self.value - other.value
-        return TropicalSemiring(result_value)
-
-    def __eq__(self, other):
-        return isinstance(other, TropicalSemiring) and self.value == other.value
-
-    def __hash__(self):  # __hash__ is required if defining __eq__
-        return hash(self.value)
-
-    def __format__(self, format_spec):
-        return format(self.value, format_spec)
-
-
-TropicalSemiring.zero = TropicalSemiring(math.inf)
-TropicalSemiring.one = TropicalSemiring(0)

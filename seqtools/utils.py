@@ -4,8 +4,6 @@ import logging
 import os
 import sys
 import pdb
-import argparse
-import json
 import collections
 import random
 import shutil
@@ -14,7 +12,6 @@ from collections import deque
 from matplotlib import pyplot as plt
 import numpy as np
 import joblib
-from scipy import misc
 
 
 logger = logging.getLogger(__name__)
@@ -110,7 +107,7 @@ def makeProcessTimeStr(elapsed_time):
 
 
 def exceptionHandler(exc_type, exc_value, exc_traceback):
-    """ [] """
+    """ Log non-KeyboardInterrupt exceptions, then start pdb in postmortem mode. """
     # Ignore KeyboardInterrupt so a console python program can exit with
     # Ctrl + C
     if issubclass(exc_type, KeyboardInterrupt):
@@ -286,8 +283,7 @@ def nearestIndex(sequence, val, seq_sorted=False):
 
 
 def nearestIndexSorted(sequence, val):
-    """
-    Return the index in `sequence` which is closest to `val` in absolute value.
+    """ Return the index in `sequence` which is closest to `val` in absolute value.
 
     Parameters
     ----------
@@ -386,8 +382,7 @@ def signalEdges(sequence, edge_type=None):
 
 
 def arrayMatchesAny(source_array, target_set):
-    """
-    Elementwise implementation of `source_array in target_set`.
+    """ Elementwise implementation of `source_array in target_set`.
 
     Parameters
     ----------
@@ -428,10 +423,6 @@ def filterSeqs(seqs_to_filter, ref_seqs, filter_func=isEmpty):
     return tuple(x for x, y in pairs if not filter_func(y))
 
 
-def resampleSeqs(sample_seqs, sample_times, new_times):
-    return iterate(resampleSeq, sample_seqs, sample_times, new_times)
-
-
 def resampleSeq(sample_seq, sample_times, new_times):
     """ Resample a signal by choosing the nearest sample in time. """
 
@@ -446,10 +437,7 @@ def resampleSeq(sample_seq, sample_times, new_times):
 
 
 def drawRandomSample(samples, sample_times, start_time, end_time):
-    """
-    Draw a sample uniformly at random from the set of samples that
-    occur between start_time and end_time.
-    """
+    """ Draw a sample uniformly at random from the samples between start_time and end_time. """
     start_index = nearestIndex(sample_times, start_time, seq_sorted=True)
     end_index = nearestIndex(sample_times, end_time, seq_sorted=True)
 
@@ -458,9 +446,9 @@ def drawRandomSample(samples, sample_times, start_time, end_time):
 
 
 def computeWindowLength(window_duration, sample_rate):
-    """
-    Convert window duration (units of time) to window length (units of samples).
-    This assumes uniform sampling.
+    """ Convert window duration (units of time) to window length (units of samples).
+
+    NOTE: This assumes uniform sampling.
     """
     return round(window_duration * sample_rate)
 
@@ -549,6 +537,35 @@ def select(indices, sequence):
     return drawSamples(sequence, indices)
 
 
+def extractWindows(signal, window_size=10, return_window_indices=False):
+    """ Reshape a signal into a series of non-overlapping windows.
+
+    Parameters
+    ----------
+    signal : numpy array, shape (num_samples,)
+    window_size : int, optional
+    return_window_indices : bool, optional
+
+    Returns
+    -------
+    windows : numpy array, shape (num_windows, window_size)
+    window_indices : numpy array of int, shape (num_windows, window_size)
+    """
+
+    tail_len = signal.shape[0] % window_size
+    pad_arr = np.full(window_size - tail_len, np.nan)
+    signal_padded = np.concatenate((signal, pad_arr))
+    windows = signal_padded.reshape((-1, window_size))
+
+    if not return_window_indices:
+        return windows
+
+    indices = np.arange(signal_padded.shape[0])
+    window_indices = indices.reshape((-1, window_size))
+
+    return windows, window_indices
+
+
 # --=( FUNCTIONAL PROGRAMMING )=-----------------------------------------------
 def mapValues(function, dictionary):
     """ Map `function` to the values of `dictionary`. """
@@ -556,10 +573,9 @@ def mapValues(function, dictionary):
 
 
 def compose(*functions):
-    """
-    Compose functions left-to-right.
+    """ Compose functions left-to-right.
 
-    NOTE: This implementation was inspired by a blog post by Mathieu Larose.
+    NOTE: This implementation is based on a blog post by Mathieu Larose.
         https://mathieularose.com/function-composition-in-python/
 
     Parameters
@@ -586,8 +602,7 @@ def compose(*functions):
 
 
 def pipeline(*functions):
-    """
-    Compose functions right-to-left.
+    """ Compose functions right-to-left.
 
     This function mimics a data pipeline:
         input --> pipeline(function 1, function 2, ..., function n) --> output
@@ -612,7 +627,7 @@ def pipeline(*functions):
     return compose(*reversed(functions))
 
 
-def iterate(
+def batchProcess(
         function, *input_sequences,
         obj=tuple, unzip=False,
         static_args=None, static_kwargs=None):
@@ -638,9 +653,6 @@ def iterate(
     return ret
 
 
-batchProcess = iterate
-
-
 def zipValues(*dicts):
     """ Iterate over dictionaries with the same keys, ensuring the values are
     always ordered the same way. """
@@ -663,11 +675,9 @@ def zipValues(*dicts):
 
 
 class Integerizer(object):
-    """
-    A collection of distinct object types, such as a vocabulary or a set of parameter names,
-    that are associated with consecutive ints starting at 0.
+    """ Collection associating distinct object types with consecutive integers.
 
-    NOTE: copied from https://github.com/seq2class/assignment3/blob/master/seq2class_homework2.py
+    NOTE: based on https://github.com/seq2class/assignment3/blob/master/seq2class_homework2.py
     NOTE 2: objects must be hashable
     """
 
@@ -757,19 +767,8 @@ class UnhashableIntegerizer(Integerizer):
         return len(self) - 1
 
 
-class storeDictKeyPair(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        k, v = values
-        v = json.loads(v)
-
-        options_dict = getattr(namespace, self.dest)
-        options_dict[k] = v
-        setattr(namespace, self.dest, options_dict)
-
-
 def countItems(items):
-    """
-    Count each unique element occuring in `items`.
+    """ Count each unique element occuring in `items`.
 
     Parameters
     ----------
@@ -793,35 +792,66 @@ def countItems(items):
 
 
 # --=( NUMERICAL COMPUTATIONS )=-----------------------------------------------
-def logMean(X, axis=None, weights=None):
-    """ Compute the mean of a log-domain input using the log-sum-exp trick.
+def plotArray(data, fn=None, label=None):
+    """ Plot an array with accompanying colorbar. """
 
-    FIXME: This is stupid, it just calls logsumexp
+    num_rows, num_cols = data.shape
+
+    fig, ax = plt.subplots()
+    cax = ax.imshow(data, aspect='auto')
+
+    if label is not None:
+        ax.set_title(label)
+
+    if num_rows > num_cols:
+        fig.colorbar(cax, pad=0.05)
+    else:
+        fig.colorbar(cax, orientation='horizontal', pad=0.05)
+
+    fig.tight_layout()
+
+    if fn is not None:
+        plt.savefig(fn)
+        plt.close()
+
+
+def nanargmax(signal, axis=1):
+    """ Select the greatest non-Nan entry from each row.
+
+    If a row does not contain at least one non-NaN entry, it does not have a
+    corresponding output.
 
     Parameters
     ----------
-    X : numpy array
-        An array whose values are represented in the log domain.
+    signal : numpy array, shape (num_rows, num_cols)
+        The reference signal for argmax. This is usually an array constructed
+        by windowing a univariate signal. Each row is a window of the signal.
     axis : int, optional
-        Behaves like np.mean()
-    weights : float or, optional
-        Scaling factor for `exp(X)`---ie these are in the real domain, not log.
-        If None, defaults to
+        Axis along which to compute the argmax. Not implemented yet.
 
     Returns
     -------
-    log_mean_X : numpy array
-        The mean of X, represented in log domain.
+    non_nan_row_idxs : numpy array of int, shape (num_non_nan_rows,)
+        An array of the row indices in `signal` that have at least one non-NaN
+        entry, arranged in increasing order.
+    non_nan_argmax : numpy array of int, shape (num_non_nan_rows,)
+        An array of the greatest non-NaN entry in `signal` for each of the rows
+        in `non_nan_row_idxs`.
     """
 
-    if weights is None:
-        if axis is None:
-            num_elements = X.size
-        else:
-            num_elements = X.shape[axis]
-        weights = 1 / num_elements
+    if axis != 1:
+        err_str = 'Only axis 1 is supported right now'
+        raise NotImplementedError(err_str)
 
-    return misc.logsumexp(X, axis=axis, b=weights)
+    # Determine which rows contain all NaN
+    row_is_all_nan = np.isnan(signal).all(axis=1)
+    non_nan_row_idxs = np.nonzero(~row_is_all_nan)[0]
+
+    # Find the (non-NaN) argmax of each row with at least one non-NaN value
+    non_nan_rows = signal[~row_is_all_nan, :]
+    non_nan_argmax = np.nanargmax(non_nan_rows, axis=1)
+
+    return non_nan_row_idxs, non_nan_argmax
 
 
 def argmaxNd(array):
@@ -884,25 +914,7 @@ def int2boolarray(integer, num_objects):
     return bool_array
 
 
-def plotArray(data, fn, label):
-    num_rows, num_cols = data.shape
-
-    fig, ax = plt.subplots()
-    cax = ax.imshow(data, aspect='auto')
-    ax.set_title(label)
-
-    if num_rows > num_cols:
-        fig.colorbar(cax, pad=0.05)
-    else:
-        fig.colorbar(cax, orientation='horizontal', pad=0.05)
-
-    fig.tight_layout()
-    plt.savefig(fn)
-    plt.close('all')
-
-
-# FIXME: rename to roundToInt
-def castToInt(X):
+def roundToInt(X):
     """ Round a numpy array to the nearest integer.
 
     Parameters
@@ -916,9 +928,6 @@ def castToInt(X):
 
     rounded = np.rint(X).astype(int)
     return rounded
-
-
-roundToInt = castToInt
 
 
 def splitColumns(X):
