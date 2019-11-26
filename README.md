@@ -15,7 +15,7 @@ user@host:~$ pip install -e /PATH/TO/seqtools/
 ```
 
 ## Usage
-See `tests` for usage examples (but there are none right now).
+See `tests` for usage examples.
 
 [pytorch-struct]: https://github.com/harvardnlp/pytorch-struct
 [mfst]: https://github.com/matthewfl/openfst-wrapper
