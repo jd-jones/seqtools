@@ -1,6 +1,18 @@
 out_dir: '~/repo/seqtools/test_output/fsm'
 learning_rate: 0.001
 gpu_dev_id: '0'
-num_epochs: 50
+num_epochs: 100
 sample_size: 10
 random_seed: 0
+dataset_kwargs: {
+    # transpose_data: True
+}
+dataloader_kwargs: {
+    batch_size: 1,
+    num_workers: 0,
+    shuffle: True
+}
+model_kwargs: {
+    requires_grad: True,
+    # forward_uses_max: False
+}

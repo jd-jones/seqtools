@@ -33,7 +33,8 @@ def sampleGHMM(start_probs, end_probs, transition_probs, means, covs):
 def main(
         out_dir=None, gpu_dev_id=None,
         sample_size=10, random_seed=None,
-        learning_rate=1e-3, num_epochs=500):
+        learning_rate=1e-3, num_epochs=500,
+        dataset_kwargs={}, dataloader_kwargs={}, model_kwargs={}):
 
     out_dir = os.path.expanduser(out_dir)
 
@@ -43,9 +44,9 @@ def main(
     device = torchutils.selectDevice(gpu_dev_id)
 
     start_probs = np.array([0, 0.25, 0.75])
-    end_probs = np.array([0.05, 0.05, 0])
+    end_probs = np.array([0.05, 0, 0])
     transition_probs = np.array([
-        [0.8, 0.1, 0.1],
+        [0.8, 0.2, 0.0],
         [0.1, 0.8, 0.1],
         [0.1, 0.1, 0.8],
     ])
@@ -68,10 +69,13 @@ def main(
         )
     )
 
-    dataset = torchutils.SequenceDataset(obsv_seqs, label_seqs)
-    data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=0, shuffle=True)
+    dataset = torchutils.SequenceDataset(obsv_seqs, label_seqs, **dataset_kwargs)
+    data_loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
-    class CRF(fsm.FstScorer, torchutils.LinearClassifier):
+    # class CRF(fsm.FstScorer, torchutils.LinearClassifier):
+    #     pass
+
+    class CRF(torchutils.LinearChainScorer, torchutils.LinearClassifier):
         pass
 
     train_loader = data_loader
@@ -80,11 +84,13 @@ def main(
     input_dim = dataset.num_obsv_dims
     output_dim = transition_probs.shape[0]
 
+    transition_weights = torch.randn(transition_probs.shape).to(device)
+    # transition_weights = torch.tensor(transition_probs, device=device).float().log()
+
     model = CRF(
-        torch.tensor(transition_probs).float().log(), input_dim, output_dim,
-        init_weights=None, final_weights=None, device=device,
-        requires_grad=True,
-        # forward_uses_max=True
+        transition_weights, input_dim, output_dim,
+        initial_weights=None, final_weights=None,
+        **model_kwargs
     )
 
     # Train the model
@@ -95,7 +101,8 @@ def main(
         'Accuracy': metrics.Accuracy()
     }
 
-    criterion = fsm.fstNLLLoss
+    # criterion = fsm.fstNLLLoss
+    criterion = torchutils.StructuredNLLLoss
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=1.00)
 

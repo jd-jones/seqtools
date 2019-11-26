@@ -248,6 +248,13 @@ class UnhashableFstIntegerizer(FstIntegerizer, utils.UnhashableIntegerizer):
     pass
 
 
+def printGradNorm(grad):
+    logger.info(f'grad: {type(grad)}')
+    logger.info(f'grad[0]: {type(grad[0])}')
+    logger.info(f'gradsize: {grad[0].size()}')
+    logger.info(f'grad norm: {grad[0].norm()}')
+
+
 def fstNLLLoss(decode_graphs, label_seqs):
     """ Compute structured negative-log-likelihood loss using FST methods.
 
@@ -294,7 +301,7 @@ class FstScorer(object):
 
     def __init__(
             self, transition_weights, *super_args,
-            init_weights=None, final_weights=None, semiring=None, requires_grad=False,
+            initial_weights=None, final_weights=None, semiring=None, requires_grad=False,
             forward_uses_max=False,
             integerizer=None, vocabulary=None, device=None,
             **super_kwargs):
@@ -304,6 +311,9 @@ class FstScorer(object):
         """
 
         super().__init__(*super_args, **super_kwargs)
+
+        if device is None:
+            device = transition_weights.device
 
         if vocabulary is None:
             vocabulary = tuple(range(transition_weights.shape[0]))
@@ -317,8 +327,8 @@ class FstScorer(object):
         if final_weights is None:
             final_weights = torch.full(transition_weights.shape[0:1], semiring.one.value)
 
-        if init_weights is None:
-            init_weights = torch.full(transition_weights.shape[0:1], semiring.one.value)
+        if initial_weights is None:
+            initial_weights = torch.full(transition_weights.shape[0:1], semiring.one.value)
 
         self.vocabulary = vocabulary
 
@@ -331,7 +341,7 @@ class FstScorer(object):
         self.device = device
 
         # Register semiring zero and one elements so they will be on the same
-        # as the model's params
+        # device as the model's params
         self._semiring_zero = torch.nn.Parameter(
             self.semiring.zero.value.to(device),
             requires_grad=False
@@ -346,15 +356,15 @@ class FstScorer(object):
         self.transition_weights = torch.nn.Parameter(
             transition_weights.to(device), requires_grad=requires_grad
         )
-        self.init_weights = torch.nn.Parameter(
-            init_weights.to(device), requires_grad=requires_grad
+        self.initial_weights = torch.nn.Parameter(
+            initial_weights.to(device), requires_grad=requires_grad
         )
         self.final_weights = torch.nn.Parameter(
             final_weights.to(device), requires_grad=requires_grad
         )
 
         self.label_scorer = fromTransitions(
-            self.transition_weights, self.init_weights, self.final_weights, self.mapper,
+            self.transition_weights, self.initial_weights, self.final_weights, self.mapper,
             semiring=self.semiring
         )
 
@@ -378,17 +388,15 @@ class FstScorer(object):
         return self._label_scorer_tropical_sr
 
     def forward(self, batch, use_tropical_semiring=None):
-        # Predict all data scores in batch mode
-        batch_data_scores = super().forward(batch)
-
         if use_tropical_semiring is None:
             use_tropical_semiring = self.forward_uses_max
+
+        # Predict all data scores in batch mode
+        batch_data_scores = super().forward(batch)
 
         if use_tropical_semiring:
             label_scorer = self.label_scorer_tropical_sr
             semiring = semirings.TropicalSemiringWeight
-            # semiring.zero = semiring(torch.tensor(float(semiring.zero.value), device=self.device))
-            # semiring.one = semiring(torch.tensor(float(semiring.one.value), device=self.device).float())
             batch_data_scores = -batch_data_scores
         else:
             label_scorer = self.label_scorer
@@ -403,6 +411,7 @@ class FstScorer(object):
             ).compose(label_scorer)
             for data_scores in batch_data_scores
         )
+
         return decode_graphs
 
     def predict(self, decode_graphs):

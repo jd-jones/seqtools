@@ -128,6 +128,8 @@ def StructuredNLLLoss(log_potentials, label, lengths=None, structure=None):
     )
     loss = -dist.log_prob(label_events).sum()
 
+    # logger.info(f"labels: {label[0]}")
+
     return loss
 
 
@@ -581,6 +583,128 @@ class LinearClassifier(nn.Module):
     def forward(self, input_seq):
         output_seq = self.linear(input_seq)
         return output_seq
+
+
+class LinearChainScorer(object):
+    """ Pytorch mixin that creates a linear-chain score table.
+
+    Attributes
+    ----------
+    transition_weights : torch.Tensor of float, shape (num_classes, num_classes)
+        Element (i, j) corresponds to (cur segment == i, prev segment == j);
+        i.e. the transpose of how a HMM's transition array is usually arranged.
+    start_weights : torch.Tensor of float, shape (num_classes,), optional
+    end_weights : torch.Tensor of float, shape (num_classes,), optional
+    """
+
+    def __init__(
+            self, transition_weights, *super_args,
+            initial_weights=None, final_weights=None,
+            requires_grad=False,
+            **super_kwargs):
+        """
+        Parameters
+        ----------
+        transitions : torch.Tensor of float, shape (num_classes, num_classes), optional
+            Element (i, j) corresponds to (cur segment == i, prev segment == j);
+            i.e. the transpose of how a HMM's transition array is usually arranged.
+        initial_states : torch.Tensor of float, shape (num_classes,), optional
+        final_states : torch.Tensor of float, shape (num_gestures,), optional
+        requires_grad : bool, optional
+            If True, start, end, and transition weights will be updated during
+            training.
+        *super_args, **super_kwargs : optional
+            Remaining arguments are passed to super's init method.
+        """
+
+        super().__init__(*super_args, **super_kwargs)
+
+        if final_weights is None:
+            final_weights = torch.full(transition_weights.shape[0:1], 0)
+
+        if initial_weights is None:
+            initial_weights = torch.full(transition_weights.shape[0:1], 0)
+
+        self.transition_weights = torch.nn.Parameter(
+            transition_weights, requires_grad=requires_grad
+        )
+        self.initial_weights = torch.nn.Parameter(
+            initial_weights, requires_grad=requires_grad
+        )
+        self.final_weights = torch.nn.Parameter(
+            final_weights, requires_grad=requires_grad
+        )
+
+    def predict(self, outputs):
+        dist = torch_struct.LinearChainCRF(outputs)
+        preds, _ = dist.struct.from_parts(dist.argmax)
+        return preds
+
+    def forward(self, attribute_scores):
+        """ Construct a table of semi-Markov (i.e. segmental) scores.
+
+        These scores can be used to instantiate pytorch-struct's SemiMarkovCRF.
+
+        Parameters
+        ----------
+        attribute_scores : torch.Tensor of float, shape (batch_size, ..., num_samples)
+            NOTE: This method doesn't handle inputs with batch size > 1 (yet).
+
+        Returns
+        -------
+        log_potentials : torch.Tensor of float,
+                shape (batch_size, num_samples, max_duration, num_classes, num_classes)
+        """
+
+        batch_size = attribute_scores.shape[0]
+        num_samples = attribute_scores.shape[-1]
+        num_labels = self.initial_weights.shape[0]
+
+        scores_shape = (batch_size, num_samples - 1, num_labels, num_labels)
+        log_potentials = torch.full(scores_shape, -float("Inf"), device=attribute_scores.device)
+
+        for sample_index in range(1, num_samples):
+            # FIXME: Line below only looks at first sample in batch. I think
+            #   pytorch's default array broadcasting should make full-batch
+            #   computations work just fine, but I haven't tried it.
+            sample = attribute_scores[0:1, ..., sample_index]
+            scores = self.scoreSample(sample)
+
+            if sample_index == 1:
+                scores += self.initial_weights + self.scoreSample(attribute_scores[0:1, ..., 0])
+                # Arrange scores as a column vector so tensor broadcasting
+                # replicates scores across columns---scores array needs to
+                # have shape matching (cur segment) x (prev segment)
+                scores = scores[:, :, None]
+            elif sample_index == num_samples - 1:
+                scores += self.final_weights
+                # Arrange scores as a column vector so tensor broadcasting
+                # replicates scores across columns---scores array needs to
+                # have shape matching (cur segment) x (prev segment)
+                scores = scores[:, :, None]
+            # FIXME: Make sure transition dimensions are broadcast
+            #   correctly for batch sizes > 1
+            scores = scores + self.transition_weights
+
+            log_potentials[0:1, sample_index - 1, :, :] = scores
+
+        return log_potentials
+
+    def scoreSample(self, sample):
+        """ Score a sample.
+
+        Parameters
+        ----------
+        sample : torch.Tensor of float, shape (batch_size, ..., segment_len)
+
+        Returns
+        -------
+        scores : torch.Tensor of float, shape (batch_size, num_classes)
+        """
+
+        # This flattens the segment if it was a sliding window of features
+        sample = sample.contiguous().view(sample.shape[0], sample.shape[1], -1)
+        return super().forward(sample)  # .sum(dim=-1)
 
 
 class SemiMarkovScorer(object):
