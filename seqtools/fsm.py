@@ -227,17 +227,22 @@ class FST(mfst.FST):
 
 
 class FstIntegerizer(object):
-    def __init__(self, iterable=[]):
+    def __init__(self, iterable=[], prepend_epsilon=True):
         # OpenFST hardcodes zero to represent epsilon transitions---so make sure
         # our integerizer is consistent with that.
-        super().__init__(['epsilon'])
-        self.update(iterable)
+        if prepend_epsilon:
+            iterable = ['epsilon'] + iterable
+
+        super().__init__(iterable)
 
     def updateFromSequences(self, sequences):
         self.update(itertools.chain(*sequences))
 
     def integerizeSequence(self, sequence):
         return tuple(self.index(x) for x in sequence)
+
+    def deintegerizeSequence(self, index_sequence):
+        return tuple(self[i] for i in index_sequence)
 
 
 class HashableFstIntegerizer(FstIntegerizer, utils.Integerizer):
@@ -246,48 +251,6 @@ class HashableFstIntegerizer(FstIntegerizer, utils.Integerizer):
 
 class UnhashableFstIntegerizer(FstIntegerizer, utils.UnhashableIntegerizer):
     pass
-
-
-def printGradNorm(grad):
-    logger.info(f'grad: {type(grad)}')
-    logger.info(f'grad[0]: {type(grad[0])}')
-    logger.info(f'gradsize: {grad[0].size()}')
-    logger.info(f'grad norm: {grad[0].norm()}')
-
-
-def fstNLLLoss(decode_graphs, label_seqs):
-    """ Compute structured negative-log-likelihood loss using FST methods.
-
-    NOTE: Right now this library handles mini-batches by iterating over each
-        item in the batch, so batch operations are not vectorized.
-
-    Parameters
-    ----------
-    decode_graphs : iterable(fsm.FST)
-    label_seqs : torch.Tensor of int, shape (batch_size, num_samples)
-
-    Returns
-    -------
-    loss : float
-    """
-
-    def generateLosses(decode_graphs, label_seqs):
-        for decode_graph, label_seq in zip(decode_graphs, label_seqs):
-            # FIXME: We need a more consistent way of mapping to/from the arc labels
-            gt_path_acceptor = FST(decode_graph.semiring).create_from_string(label_seq + 1)
-            gt_path_score = decode_graph.compose(gt_path_acceptor).sum_paths().value
-            total_path_score = decode_graph.sum_paths().value
-
-            if decode_graph.semiring is semirings.LogSemiringWeight:
-                yield -(gt_path_score - total_path_score)
-            elif decode_graph.semiring is semirings.RealSemiringWeight:
-                yield -(torch.log(gt_path_score) - torch.log(total_path_score))
-            elif decode_graph.semiring is semirings.TropicalSemiringWeight:
-                yield gt_path_score - total_path_score
-            else:
-                raise AssertionError(f"{decode_graph.semiring} is not supported by fstNLLLoss")
-
-    return torch.stack(tuple(generateLosses(decode_graphs, label_seqs)))
 
 
 class FstScorer(object):
@@ -423,29 +386,6 @@ class FstScorer(object):
         return x
 
 
-def argmax(decode_graph, count=1, squeeze=True):
-    if decode_graph.semiring is not semirings.TropicalSemiringWeight:
-        if decode_graph.semiring is semirings.LogSemiringWeight:
-            def converter(weight):
-                return -weight.value
-        elif decode_graph.semiring is semirings.RealSemiringWeight:
-            def converter(weight):
-                return -weight.value.log()
-        else:
-            raise NotImplementedError("Conversion to tropical semiring isn't implemented yet")
-        decode_graph = decode_graph.lift(
-            semiring=semirings.TropicalSemiringWeight, converter=converter
-        )
-
-    lattice = decode_graph.shortest_path(count=count)
-    best_paths = tuple(path.output_path for path in lattice.iterate_paths())
-
-    if squeeze and len(best_paths) == 1:
-        return best_paths[0]
-
-    return best_paths
-
-
 class AbstractFstSequenceModel(object):
     def __init__(self, *args, **kwargs):
         self._process_fst = None
@@ -496,70 +436,40 @@ class AbstractFstSequenceModel(object):
         raise NotImplementedError
 
 
-def traverse(fst):
-    """ Traverse a transducer, accumulating edge weights and labels.
+# -=( LIBRARY FUNCTIONS )==-----------------------------------------------------
+def fstNLLLoss(decode_graphs, label_seqs):
+    """ Compute structured negative-log-likelihood loss using FST methods.
+
+    NOTE: Right now this library handles mini-batches by iterating over each
+        item in the batch, so batch operations are not vectorized.
 
     Parameters
     ----------
-    fst : FST
+    decode_graphs : iterable(fsm.FST)
+    label_seqs : torch.Tensor of int, shape (batch_size, num_samples)
 
     Returns
     -------
-    weights_dict : dict((int, int) -> semirings.AbstractSemiringWeight)
-    all_input_labels : set(int)
-    all_output_labels : set(int)
+    loss : float
     """
 
-    # FIXME: make this a method in the FST or something
-    def make_label(x):
-        if x == 0:
-            x = 'epsilon'
-        if x == 32:
-            x = '(spc)'
-        elif x < 32:
-            x = str(x)
-        else:
-            # OpenFST will encode characters as integers
-            x = int(chr(x))
-        return x
+    def generateLosses(decode_graphs, label_seqs):
+        for decode_graph, label_seq in zip(decode_graphs, label_seqs):
+            # FIXME: We need a more consistent way of mapping to/from the arc labels
+            gt_path_acceptor = FST(decode_graph.semiring).create_from_string(label_seq + 1)
+            gt_path_score = decode_graph.compose(gt_path_acceptor).sum_paths().value
+            total_path_score = decode_graph.sum_paths().value
 
-    weights_dict = {}
-    all_input_labels = set()
-    all_output_labels = set()
-
-    state = fst.initial_state
-    to_visit = [state]
-    queued_states = set(to_visit)
-    while to_visit:
-        state = to_visit.pop()
-        for edge in fst.get_arcs(state):
-            # Final weights are implemented as arcs whose inputs and outputs
-            # are epsilon, and whose next state is -1 (ie an impossible next
-            # state). I account for final weights using fst.get_final_weight,
-            # so we can skip them here.
-            if edge.nextstate < 0:
-                continue
-
-            if edge.nextstate not in queued_states:
-                queued_states.add(edge.nextstate)
-                to_visit.append(edge.nextstate)
-
-            weight = edge.weight
-
-            input_label = make_label(edge.input_label)
-            output_label = make_label(edge.output_label)
-            if fst._acceptor:
-                edge_labels = (state, input_label)
+            if decode_graph.semiring is semirings.LogSemiringWeight:
+                yield -(gt_path_score - total_path_score)
+            elif decode_graph.semiring is semirings.RealSemiringWeight:
+                yield -(torch.log(gt_path_score) - torch.log(total_path_score))
+            elif decode_graph.semiring is semirings.TropicalSemiringWeight:
+                yield gt_path_score - total_path_score
             else:
-                edge_labels = (state, input_label, output_label)
-            if edge_labels in weights_dict:
-                weights_dict[edge_labels] += weight
-            else:
-                weights_dict[edge_labels] = weight
-            all_input_labels.add(input_label)
-            all_output_labels.add(output_label)
+                raise AssertionError(f"{decode_graph.semiring} is not supported by fstNLLLoss")
 
-    return weights_dict, all_input_labels, all_output_labels
+    return torch.stack(tuple(generateLosses(decode_graphs, label_seqs)))
 
 
 def toArray(fst, input_labels=None, output_labels=None, array_constructor=None):
@@ -765,6 +675,44 @@ def fromTransitions(
     return fst
 
 
+def align(scores, label_seq):
+    """ Align (ie segment) a sequence of scores, given a known label sequence.
+
+    NOTE: I don't know if this works with score tables that have more than 9
+        columns.
+
+    Parameters
+    ----------
+    scores : array_like of float, shape (num_samples, num_labels)
+        Log probabilities (possibly un-normalized).
+    label_seq : iterable(string or int)
+        The segment-level label sequence.
+
+    Returns
+    -------
+    aligned_labels : tuple(int)
+    alignment_score : semirings.TropicalSemiringWeight
+        Score of the best path through the alignment graph (possible un-normalized)
+    """
+
+    scores_fst = fromArray(-scores, semiring=semirings.TropicalSemiringWeight)
+    label_fst = leftToRightAcceptor(label_seq, semiring=semirings.TropicalSemiringWeight)
+    aligner = scores_fst.compose(label_fst)
+
+    best_path_lattice = aligner.shortest_path()
+    aligned_labels = best_path_lattice.get_unique_output_string()
+    if aligned_labels is not None:
+        aligned_labels = tuple(int(c) for c in aligned_labels)
+    # NOTE: this gives the negative log probability of the single best path,
+    #   not that of all paths, because best_path_lattice uses the tropical semiring.
+    #   In this case it's fine because we only have one path anyway. If we want
+    #   to marginalize over the k-best paths in the future, we will need to lift
+    #   best_path_lattice to the real or log semiring before calling sum_paths.
+    alignment_score = -(best_path_lattice.sum_paths().value)
+
+    return aligned_labels, alignment_score
+
+
 def leftToRightAcceptor(input_seq, semiring=None, string_mapper=None):
     """ Construct a left-to-right finite-state acceptor from an input sequence.
 
@@ -812,44 +760,6 @@ def leftToRightAcceptor(input_seq, semiring=None, string_mapper=None):
     return acceptor
 
 
-def align(scores, label_seq):
-    """ Align (ie segment) a sequence of scores, given a known label sequence.
-
-    NOTE: I don't know if this works with score tables that have more than 9
-        columns.
-
-    Parameters
-    ----------
-    scores : array_like of float, shape (num_samples, num_labels)
-        Log probabilities (possibly un-normalized).
-    label_seq : iterable(string or int)
-        The segment-level label sequence.
-
-    Returns
-    -------
-    aligned_labels : tuple(int)
-    alignment_score : semirings.TropicalSemiringWeight
-        Score of the best path through the alignment graph (possible un-normalized)
-    """
-
-    scores_fst = fromArray(-scores, semiring=semirings.TropicalSemiringWeight)
-    label_fst = leftToRightAcceptor(label_seq, semiring=semirings.TropicalSemiringWeight)
-    aligner = scores_fst.compose(label_fst)
-
-    best_path_lattice = aligner.shortest_path()
-    aligned_labels = best_path_lattice.get_unique_output_string()
-    if aligned_labels is not None:
-        aligned_labels = tuple(int(c) for c in aligned_labels)
-    # NOTE: this gives the negative log probability of the single best path,
-    #   not that of all paths, because best_path_lattice uses the tropical semiring.
-    #   In this case it's fine because we only have one path anyway. If we want
-    #   to marginalize over the k-best paths in the future, we will need to lift
-    #   best_path_lattice to the real or log semiring before calling sum_paths.
-    alignment_score = -(best_path_lattice.sum_paths().value)
-
-    return aligned_labels, alignment_score
-
-
 def sequenceFsa(seqs, integerizer):
     sequence_acceptor = FST(
         semirings.TropicalSemiring, string_mapper=lambda i: str(integerizer[i])
@@ -866,23 +776,137 @@ def sequenceFsa(seqs, integerizer):
     return sequence_acceptor
 
 
+# -=( HELPER FUNCTIONS )==-----------------------------------------------------
 def countSeqs(seqs):
-    edge_counts = collections.defaultdict(int)
-    state_counts = collections.defaultdict(int)
-    init_states = set()
-    final_states = set()
+    """ Count n-gram statistics on a collection of sequences.
+
+    Parameters
+    ----------
+    seqs : iterable( iterable(Hashable) )
+
+    Returns
+    -------
+    bigram_counts : collections.defaultdict((Hashable, Hashable) -> int)
+    unigram_counts : collections.defaultdict(Hashable -> int)
+    initial_counts : collections.defaultdict(Hashable -> int)
+    final_counts : collections.defaultdict(Hashable -> int)
+    """
+
+    bigram_counts = collections.defaultdict(int)
+    unigram_counts = collections.defaultdict(int)
+    initial_counts = collections.defaultdict(int)
+    final_counts = collections.defaultdict(int)
 
     for seq in seqs:
-        init_states.add(seq[0])
-        final_states.add(seq[-1])
+        initial_counts[seq[0]] += 1
+        final_counts[seq[-1]] += 1
         for state in seq:
-            state_counts[state] += 1
+            unigram_counts[state] += 1
         for prev, cur in zip(seq[:-1], seq[1:]):
-            edge_counts[prev, cur] += 1
+            bigram_counts[prev, cur] += 1
 
-    return edge_counts, state_counts, init_states, final_states
+    return bigram_counts, unigram_counts, initial_counts, final_counts
 
 
+def printGradNorm(grad):
+    logger.info(f'grad: {type(grad)}')
+    logger.info(f'grad[0]: {type(grad[0])}')
+    logger.info(f'gradsize: {grad[0].size()}')
+    logger.info(f'grad norm: {grad[0].norm()}')
+
+
+def argmax(decode_graph, count=1, squeeze=True):
+    """ """
+
+    if decode_graph.semiring is not semirings.TropicalSemiringWeight:
+        if decode_graph.semiring is semirings.LogSemiringWeight:
+            def converter(weight):
+                return -weight.value
+        elif decode_graph.semiring is semirings.RealSemiringWeight:
+            def converter(weight):
+                return -weight.value.log()
+        else:
+            raise NotImplementedError("Conversion to tropical semiring isn't implemented yet")
+        decode_graph = decode_graph.lift(
+            semiring=semirings.TropicalSemiringWeight, converter=converter
+        )
+
+    lattice = decode_graph.shortest_path(count=count)
+    best_paths = tuple(path.output_path for path in lattice.iterate_paths())
+
+    if squeeze and len(best_paths) == 1:
+        return best_paths[0]
+
+    return best_paths
+
+
+def traverse(fst):
+    """ Traverse a transducer, accumulating edge weights and labels.
+
+    Parameters
+    ----------
+    fst : FST
+
+    Returns
+    -------
+    weights_dict : dict((int, int) -> semirings.AbstractSemiringWeight)
+    all_input_labels : set(int)
+    all_output_labels : set(int)
+    """
+
+    # FIXME: make this a method in the FST or something
+    def make_label(x):
+        if x == 0:
+            x = 'epsilon'
+        if x == 32:
+            x = '(spc)'
+        elif x < 32:
+            x = str(x)
+        else:
+            # OpenFST will encode characters as integers
+            x = int(chr(x))
+        return x
+
+    weights_dict = {}
+    all_input_labels = set()
+    all_output_labels = set()
+
+    state = fst.initial_state
+    to_visit = [state]
+    queued_states = set(to_visit)
+    while to_visit:
+        state = to_visit.pop()
+        for edge in fst.get_arcs(state):
+            # Final weights are implemented as arcs whose inputs and outputs
+            # are epsilon, and whose next state is -1 (ie an impossible next
+            # state). I account for final weights using fst.get_final_weight,
+            # so we can skip them here.
+            if edge.nextstate < 0:
+                continue
+
+            if edge.nextstate not in queued_states:
+                queued_states.add(edge.nextstate)
+                to_visit.append(edge.nextstate)
+
+            weight = edge.weight
+
+            input_label = make_label(edge.input_label)
+            output_label = make_label(edge.output_label)
+            if fst._acceptor:
+                edge_labels = (state, input_label)
+            else:
+                edge_labels = (state, input_label, output_label)
+            if edge_labels in weights_dict:
+                weights_dict[edge_labels] += weight
+            else:
+                weights_dict[edge_labels] = weight
+            all_input_labels.add(input_label)
+            all_output_labels.add(output_label)
+
+    return weights_dict, all_input_labels, all_output_labels
+
+
+# -=( DEPRECATED )==-----------------------------------------------------------
 def actionTransitionFsa(seqs, integerizer, semiring=None):
     if semiring is None:
         def semiring_transform(w):

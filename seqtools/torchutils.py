@@ -641,9 +641,9 @@ class LinearChainScorer(object):
         return preds
 
     def forward(self, attribute_scores):
-        """ Construct a table of semi-Markov (i.e. segmental) scores.
+        """ Construct a table of Markov (i.e. linear-chain) scores.
 
-        These scores can be used to instantiate pytorch-struct's SemiMarkovCRF.
+        These scores can be used to instantiate pytorch-struct's LinearChainCRF.
 
         Parameters
         ----------
@@ -853,6 +853,10 @@ class SemiMarkovScorer(object):
         # This flattens the segment if it was a sliding window of features
         segment = segment.contiguous().view(segment.shape[0], segment.shape[1], -1)
         return super().forward(segment).sum(dim=-1)
+
+
+class Hmm(torch_struct.hmm):
+    pass
 
 
 def conv2dOutputShape(
