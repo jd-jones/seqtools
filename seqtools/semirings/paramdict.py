@@ -1,4 +1,6 @@
 import math
+
+
 class ParamDict(dict):    # inherits from built-in dict
     """
     A dictionary used to map parameter names to their numeric values.

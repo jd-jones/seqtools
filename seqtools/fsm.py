@@ -7,8 +7,9 @@ import graphviz
 import torch
 
 import mfst
-from . import semirings, utils
-from ._fsm_utils.expectation_semiring import ExpectationSemiringWeight
+
+from mathtools import utils
+from . import semirings
 
 
 logger = logging.getLogger(__name__)
@@ -50,19 +51,23 @@ class FST(mfst.FST):
     def sum_paths_fb(self):
         """ Use forward-backward to find the pathsum of an FST in the expectation semiring. """
 
-        assert self.semiring is ExpectationSemiringWeight
+        assert self.semiring is semirings.ExpectationSemiringWeight
 
-        self_real = self.lift(ExpectationSemiringWeight, converter=lambda w: w.dropvalue())
+        self_real = self.lift(
+            semirings.ExpectationSemiringWeight,
+            converter=lambda w: w.dropvalue()
+        )
         alpha = self_real.shortest_distance()
         beta = self_real.shortest_distance(reverse=True)
         Z = beta[self_real.initial_state]
 
-        total = ExpectationSemiringWeight(0)
+        total = semirings.ExpectationSemiringWeight(0)
         for s in self.states:
             # if s is final, then get_arcs will yield an arc to state -1 with the final-state weight
             for e in self.get_arcs(s):
                 multiplier = alpha[s] * (
-                    beta[e.nextstate] if e.nextstate >= 0 else ExpectationSemiringWeight.one
+                    beta[e.nextstate] if e.nextstate >= 0
+                    else semirings.ExpectationSemiringWeight.one
                 )
                 # avoid multiplying the big `e.weight` by alpha and beta separately
                 total += multiplier * e.weight
@@ -73,19 +78,19 @@ class FST(mfst.FST):
         return total + (Z.dropvalue() - total.dropvalue())
 
     def sum_paths_with_fb(self, *args, **kwargs):
-        if self.expectation_uses_fb and self.semiring is ExpectationSemiringWeight:
+        if self.expectation_uses_fb and self.semiring is semirings.ExpectationSemiringWeight:
             return self.sum_paths_fb(*args, **kwargs)
         else:
             return self._sum_paths(*args, **kwargs)
 
     def determinize_with_merging(self, *args, **kwargs):
-        assert self.semiring is ExpectationSemiringWeight
+        assert self.semiring is semirings.ExpectationSemiringWeight
         # temporarily modifies behavior of `quantize` on expectation semirings
         # (WARNING: not thread-safe)
-        ExpectationSemiringWeight.aggressive_quantization = True
+        semirings.ExpectationSemiringWeight.aggressive_quantization = True
         # must push first for aggressive quantization to be correct
         result = self.push().determinize(*args, **kwargs)
-        ExpectationSemiringWeight.aggressive_quantization = False
+        semirings.ExpectationSemiringWeight.aggressive_quantization = False
         return result
 
     def create_from_observable(self, oo, alphabet, wildcard='?'):

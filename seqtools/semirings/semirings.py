@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from mfst import AbstractSemiringWeight
 
-from . import torchutils
+from .. import torchutils
 
 
 def _is_real(x):
