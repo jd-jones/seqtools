@@ -236,7 +236,7 @@ class FstIntegerizer(object):
         # OpenFST hardcodes zero to represent epsilon transitions---so make sure
         # our integerizer is consistent with that.
         if prepend_epsilon:
-            iterable = ['epsilon'] + iterable
+            iterable = type(iterable)(['epsilon']) + iterable
 
         super().__init__(iterable)
 

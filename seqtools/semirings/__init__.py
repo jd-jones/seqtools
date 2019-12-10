@@ -1,2 +1,2 @@
-from semirings import *
-from expectation_semiring import *
+from .semirings import *
+from .expectation_semiring import *

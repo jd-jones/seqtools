@@ -2,12 +2,39 @@ import logging
 
 import numpy as np
 
-
 import torch
+import torch.utils.data
 import torch_struct
 
 
 logger = logging.getLogger(__name__)
+
+
+# -=( MISC )==-----------------------------------------------------------------
+
+def tensorFromSequence(sequence, **tensor_kwargs):
+    """ Stack each item of a sequence along the final dimension.
+
+    If the input has shape (num_features,), the output will have shape
+    (num_features, num_samples).
+
+    Parameters
+    ----------
+    sequence : iterable( numpy array )
+
+    Returns
+    -------
+    tensor : torch.Tensor, shape (..., num_samples)
+    """
+
+    after_last_dim = len(sequence[0].shape)
+
+    tensor = torch.stack(
+        tuple(torch.tensor(item, **tensor_kwargs) for item in sequence),
+        dim=after_last_dim
+    )
+
+    return tensor
 
 
 # -=( TRAINING & EVALUATION )=-------------------------------------------------
@@ -97,7 +124,7 @@ def fillSegments(pred_batch, in_place=False):
 
 
 # -=( DATASETS )=--------------------------------------------------------------
-class SequenceDataset(torch.nn.datasets.Dataset):
+class SequenceDataset(torch.utils.data.Dataset):
     """ A dataset wrapping sequences of numpy arrays stored in memory.
 
     Attributes
@@ -191,8 +218,8 @@ class LinearChainScorer(object):
     """
 
     def __init__(
-            self, transition_weights, *super_args,
-            initial_weights=None, final_weights=None,
+            self, *super_args,
+            transition_weights=None, initial_weights=None, final_weights=None,
             requires_grad=False,
             **super_kwargs):
         """
@@ -212,6 +239,9 @@ class LinearChainScorer(object):
 
         super().__init__(*super_args, **super_kwargs)
 
+        if transition_weights is None:
+            return
+
         if final_weights is None:
             final_weights = torch.full(transition_weights.shape[0:1], 0)
 
@@ -229,11 +259,21 @@ class LinearChainScorer(object):
         )
 
     def predict(self, outputs):
+        """
+
+        Parameters
+        ----------
+
+        Returns
+        -------
+        """
+
         dist = torch_struct.LinearChainCRF(outputs)
         preds, _ = dist.struct.from_parts(dist.argmax)
+
         return preds
 
-    def forward(self, attribute_scores):
+    def forward(self, input_seq):
         """ Construct a table of Markov (i.e. linear-chain) scores.
 
         These scores can be used to instantiate pytorch-struct's LinearChainCRF.
@@ -249,22 +289,22 @@ class LinearChainScorer(object):
                 shape (batch_size, num_samples, max_duration, num_classes, num_classes)
         """
 
-        batch_size = attribute_scores.shape[0]
-        num_samples = attribute_scores.shape[-1]
+        batch_size = input_seq.shape[0]
+        num_samples = input_seq.shape[-1]
         num_labels = self.initial_weights.shape[0]
 
         scores_shape = (batch_size, num_samples - 1, num_labels, num_labels)
-        log_potentials = torch.full(scores_shape, -float("Inf"), device=attribute_scores.device)
+        log_potentials = torch.full(scores_shape, -float("Inf"), device=input_seq.device)
 
         for sample_index in range(1, num_samples):
             # FIXME: Line below only looks at first sample in batch. I think
             #   pytorch's default array broadcasting should make full-batch
             #   computations work just fine, but I haven't tried it.
-            sample = attribute_scores[0:1, ..., sample_index]
+            sample = input_seq[0:1, ..., sample_index]
             scores = self.scoreSample(sample)
 
             if sample_index == 1:
-                scores += self.initial_weights + self.scoreSample(attribute_scores[0:1, ..., 0])
+                scores += self.initial_weights + self.scoreSample(input_seq[0:1, ..., 0])
                 # Arrange scores as a column vector so tensor broadcasting
                 # replicates scores across columns---scores array needs to
                 # have shape matching (cur segment) x (prev segment)
