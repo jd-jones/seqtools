@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 # -=( MISC )==-----------------------------------------------------------------
-
 def tensorFromSequence(sequence, **tensor_kwargs):
     """ Stack each item of a sequence along the final dimension.
 
@@ -286,12 +285,22 @@ class LinearChainScorer(object):
         Returns
         -------
         log_potentials : torch.Tensor of float,
-                shape (batch_size, num_samples, max_duration, num_classes, num_classes)
+                shape (batch_size, num_samples - 1, max_duration, num_classes, num_classes)
         """
 
-        batch_size = input_seq.shape[0]
-        num_samples = input_seq.shape[-1]
-        num_labels = self.initial_weights.shape[0]
+        # Should be shape (batch_size, seq_len, vocab_size)
+        scores = self.scoreSamples(input_seq)
+
+        # Should be shape (batch_size, seq_len - 1, vocab_size, vocab_size)
+        log_potentials = scores[:, 1:, ..., None].expand(-1, -1, -1, scores.shape[-1])
+        log_potentials += self.transition_weights
+        log_potentials[:, 0, ...] += (self.initial_weights + scores[:, 0])[:, :, None]
+        log_potentials[:, -1, ...] += self.final_weights[:, :, None]
+
+        """
+        batch_size = scores.shape[0]  # input_seq.shape[0]
+        num_samples = scores.shape[-1]
+        num_labels = scores.shape[1]  # self.initial_weights.shape[0]
 
         scores_shape = (batch_size, num_samples - 1, num_labels, num_labels)
         log_potentials = torch.full(scores_shape, -float("Inf"), device=input_seq.device)
@@ -320,24 +329,28 @@ class LinearChainScorer(object):
             scores = scores + self.transition_weights
 
             log_potentials[0:1, sample_index - 1, :, :] = scores
+        """
 
         return log_potentials
 
-    def scoreSample(self, sample):
+    def scoreSamples(self, input_seq):
         """ Score a sample.
 
         Parameters
         ----------
-        sample : torch.Tensor of float, shape (batch_size, ..., segment_len)
+        input_seq : ???
 
         Returns
         -------
-        scores : torch.Tensor of float, shape (batch_size, num_classes)
+        scores : torch.Tensor of float, shape (batch_size, seq_len, num_classes)
         """
 
         # This flattens the segment if it was a sliding window of features
-        sample = sample.contiguous().view(sample.shape[0], sample.shape[1], -1)
-        return super().forward(sample)  # .sum(dim=-1)
+        # sample = sample.contiguous().view(sample.shape[0], sample.shape[1], -1)
+        # return super().forward(sample)  # .sum(dim=-1)
+        # FIXME: Make sure the zero-th dimension of the output is the batch index
+        seq_scores = torch.stack(tuple(super().forward(sample) for sample in input_seq))
+        return seq_scores
 
 
 class SemiMarkovScorer(object):
