@@ -348,9 +348,13 @@ class LinearChainScorer(object):
         # This flattens the segment if it was a sliding window of features
         # sample = sample.contiguous().view(sample.shape[0], sample.shape[1], -1)
         # return super().forward(sample)  # .sum(dim=-1)
-        # FIXME: Make sure the zero-th dimension of the output is the batch index
-        seq_scores = torch.stack(tuple(super().forward(sample) for sample in input_seq))
-        return seq_scores
+
+        # super().forward should return a tensor of shape (batch_size, num_classes)
+        seq_scores = tuple(
+            super(LinearChainScorer, self).forward(sample)
+            for sample in input_seq
+        )
+        return torch.stack(seq_scores, dim=1)
 
 
 class SemiMarkovScorer(object):
