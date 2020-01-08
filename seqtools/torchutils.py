@@ -6,6 +6,8 @@ import torch
 import torch.utils.data
 import torch_struct
 
+from mathtools import utils
+
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +238,9 @@ class LinearChainScorer(object):
             Remaining arguments are passed to super's init method.
         """
 
-        super().__init__(*super_args, **super_kwargs)
+        super(LinearChainScorer, self).__init__(*super_args, **super_kwargs)
+
+        self.obsv_model = super(LinearChainScorer, self)
 
         if transition_weights is None:
             return
@@ -272,15 +276,19 @@ class LinearChainScorer(object):
 
         return preds
 
-    def forward(self, input_seq):
+    def forward(self, *args, **kwargs):
+        return self._create_sequence_scores(*args, **kwargs)
+
+    def _create_sequence_scores(self, input_seq, scores_as_input=False):
         """ Construct a table of Markov (i.e. linear-chain) scores.
 
         These scores can be used to instantiate pytorch-struct's LinearChainCRF.
 
         Parameters
         ----------
-        attribute_scores : torch.Tensor of float, shape (batch_size, ..., num_samples)
+        input_seq : torch.Tensor of float, shape (batch_size, ..., num_samples)
             NOTE: This method doesn't handle inputs with batch size > 1 (yet).
+        scores_as_input : bool, optional
 
         Returns
         -------
@@ -288,48 +296,17 @@ class LinearChainScorer(object):
                 shape (batch_size, num_samples - 1, max_duration, num_classes, num_classes)
         """
 
-        # Should be shape (batch_size, seq_len, vocab_size)
-        scores = self.scoreSamples(input_seq)
+        if scores_as_input:
+            scores = input_seq
+        else:
+            # Should be shape (batch_size, seq_len, vocab_size)
+            scores = self.scoreSamples(input_seq)
 
         # Should be shape (batch_size, seq_len - 1, vocab_size, vocab_size)
         log_potentials = scores[:, 1:, ..., None].expand(-1, -1, -1, scores.shape[-1])
-        log_potentials += self.transition_weights
-        log_potentials[:, 0, ...] += (self.initial_weights + scores[:, 0])[:, :, None]
-        log_potentials[:, -1, ...] += self.final_weights[:, :, None]
-
-        """
-        batch_size = scores.shape[0]  # input_seq.shape[0]
-        num_samples = scores.shape[-1]
-        num_labels = scores.shape[1]  # self.initial_weights.shape[0]
-
-        scores_shape = (batch_size, num_samples - 1, num_labels, num_labels)
-        log_potentials = torch.full(scores_shape, -float("Inf"), device=input_seq.device)
-
-        for sample_index in range(1, num_samples):
-            # FIXME: Line below only looks at first sample in batch. I think
-            #   pytorch's default array broadcasting should make full-batch
-            #   computations work just fine, but I haven't tried it.
-            sample = input_seq[0:1, ..., sample_index]
-            scores = self.scoreSample(sample)
-
-            if sample_index == 1:
-                scores += self.initial_weights + self.scoreSample(input_seq[0:1, ..., 0])
-                # Arrange scores as a column vector so tensor broadcasting
-                # replicates scores across columns---scores array needs to
-                # have shape matching (cur segment) x (prev segment)
-                scores = scores[:, :, None]
-            elif sample_index == num_samples - 1:
-                scores += self.final_weights
-                # Arrange scores as a column vector so tensor broadcasting
-                # replicates scores across columns---scores array needs to
-                # have shape matching (cur segment) x (prev segment)
-                scores = scores[:, :, None]
-            # FIXME: Make sure transition dimensions are broadcast
-            #   correctly for batch sizes > 1
-            scores = scores + self.transition_weights
-
-            log_potentials[0:1, sample_index - 1, :, :] = scores
-        """
+        log_potentials = log_potentials + self.transition_weights
+        log_potentials[:, 0, ...] += (self.initial_weights[None, :] + scores[:, 0])[:, :, None]
+        log_potentials[:, -1, ...] += self.final_weights[None, :, None]
 
         return log_potentials
 
@@ -345,15 +322,11 @@ class LinearChainScorer(object):
         scores : torch.Tensor of float, shape (batch_size, seq_len, num_classes)
         """
 
-        # This flattens the segment if it was a sliding window of features
-        # sample = sample.contiguous().view(sample.shape[0], sample.shape[1], -1)
-        # return super().forward(sample)  # .sum(dim=-1)
-
-        # super().forward should return a tensor of shape (batch_size, num_classes)
-        seq_scores = tuple(
-            super(LinearChainScorer, self).forward(sample)
-            for sample in input_seq
+        seq_scores = utils.batchProcess(
+            super(LinearChainScorer, self).forward,
+            input_seq
         )
+
         return torch.stack(seq_scores, dim=1)
 
 
