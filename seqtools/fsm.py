@@ -5,6 +5,7 @@ import itertools
 
 import graphviz
 import torch
+import numpy as np
 
 import mfst
 
@@ -118,9 +119,7 @@ class FST(mfst.FST):
         return fsa
 
     def toGraphviz(self, action_dict=None, state_dict=None):
-        """
-        When returned from an ipython cell, this will generate the FST visualization
-        """
+        """ When returned from an ipython cell, this will generate the FST visualization """
 
         fst = graphviz.Digraph("finite state machine", filename="fsm.gv")
         fst.attr(rankdir=self.display_dir)
@@ -268,26 +267,44 @@ class FstScorer(object):
     """
 
     def __init__(
-            self, transition_weights, *super_args,
-            initial_weights=None, final_weights=None, semiring=None, requires_grad=False,
-            forward_uses_max=False,
-            integerizer=None, vocabulary=None, device=None,
-            **super_kwargs):
+            self, *super_args,
+            transition_weights=None, initial_weights=None, final_weights=None,
+            train_label_seqs=None, integerizer=None, vocabulary=None, device=None,
+            semiring=None, requires_grad=False,
+            forward_uses_max=False, equivalent_symbols=None,
+            smooth_args={}, **super_kwargs):
         """
         Parameters
         ----------
         """
 
-        super().__init__(*super_args, **super_kwargs)
+        if transition_weights is None and train_label_seqs is not None:
+            if vocabulary is None:
+                vocabulary = tuple(set(itertools.chain(*train_label_seqs)))
+            if integerizer is None:
+                integerizer = HashableFstIntegerizer(vocabulary, prepend_epsilon=True)
+
+            integerizer.updateFromSequences(train_label_seqs)
+            integerized_label_seqs = tuple(map(integerizer.integerizeSequence, train_label_seqs))
+
+            if equivalent_symbols is not None:
+                def map_key(key):
+                    if key in equivalent_symbols:
+                        return equivalent_symbols[key]
+                    return key
+                integerizer._objects = [map_key(k) for k in integerizer._objects]
+
+            transition_probs, initial_probs, final_probs = smoothCounts(
+                *countSeqs(integerized_label_seqs), **smooth_args
+            )
+            transition_weights = transition_probs.log()
+            initial_weights = initial_probs.log()
+            final_weights = final_probs.log()
+
+        super().__init__(*super_args, dim_out=len(vocabulary), **super_kwargs)
 
         if device is None:
             device = transition_weights.device
-
-        if vocabulary is None:
-            vocabulary = tuple(range(transition_weights.shape[0]))
-
-        if integerizer is None:
-            integerizer = HashableFstIntegerizer(vocabulary)
 
         if semiring is None:
             semiring = semirings.LogSemiringWeight
@@ -298,7 +315,14 @@ class FstScorer(object):
         if initial_weights is None:
             initial_weights = torch.full(transition_weights.shape[0:1], semiring.one.value)
 
+        if vocabulary is None:
+            vocabulary = tuple(range(transition_weights.shape[0]))
+
+        if integerizer is None:
+            integerizer = HashableFstIntegerizer(vocabulary)
+
         self.vocabulary = vocabulary
+        self.vocabulary_idxs = {n: i for i, n in enumerate(vocabulary)}
 
         self.integerizer = integerizer
 
@@ -332,14 +356,14 @@ class FstScorer(object):
         )
 
         self.label_scorer = fromTransitions(
-            self.transition_weights, self.initial_weights, self.final_weights, self.mapper,
-            semiring=self.semiring
+            self.transition_weights, self.initial_weights, self.final_weights, self.integerizer,
+            index_names=self.integerizer, semiring=self.semiring
         )
 
         self._label_scorer_tropical_sr = None
 
-    def mapper(self, obj):
-        index = self.integerizer.index(obj)
+    def mapper(self, obj, add=False):
+        index = self.integerizer.index(obj, add=add)
 
         if index is None:
             raise KeyError()
@@ -375,7 +399,9 @@ class FstScorer(object):
             fromArray(
                 data_scores, semiring=semiring,
                 input_labels=tuple(range(1, data_scores.shape[1] + 1)),
-                output_labels=tuple(self.mapper(x) for x in self.vocabulary)
+                # output_labels=tuple(self.mapper(x) for x in self.vocabulary)
+                output_labels=self.integerizer.integerizeSequence(self.vocabulary),
+                string_mapper=self.integerizer.__getitem__
             ).compose(label_scorer)
             for data_scores in batch_data_scores
         )
@@ -383,9 +409,12 @@ class FstScorer(object):
         return decode_graphs
 
     def predict(self, decode_graphs):
-        x = tuple(
-            torch.tensor(argmax(decode_graph, count=1)) - 1
-            for decode_graph in decode_graphs
+        pred_labels = tuple(argmax(decode_graph, count=1) for decode_graph in decode_graphs)
+        x = torch.stack(
+            tuple(
+                torch.tensor([self.vocabulary_idxs[s] for s in pred_seq])
+                for pred_seq in pred_labels
+            )
         )
 
         return x
@@ -464,6 +493,8 @@ def fstNLLLoss(decode_graphs, label_seqs):
             gt_path_acceptor = FST(decode_graph.semiring).create_from_string(label_seq + 1)
             gt_path_score = decode_graph.compose(gt_path_acceptor).sum_paths().value
             total_path_score = decode_graph.sum_paths().value
+
+            # import pdb; pdb.set_trace()
 
             if decode_graph.semiring is semirings.LogSemiringWeight:
                 yield -(gt_path_score - total_path_score)
@@ -618,8 +649,8 @@ def fromArray(
 
 
 def fromTransitions(
-        transition_weights, init_weights, final_weights, label_mapper,
-        semiring=None, as_dict=False):
+        transition_weights, init_weights, final_weights, integerizer,
+        index_names=None, semiring=None, as_dict=False):
     """ Instantiate a state machine from state transitions.
 
     Parameters
@@ -635,12 +666,13 @@ def fromTransitions(
     if as_dict:
         transitions = transition_weights.keys()
         final_states = final_weights.keys()
+        init_states = init_weights.keys()
     else:
         transitions = (transition_weights != semiring.zero.value).nonzero().tolist()
         final_states = (final_weights != semiring.zero.value).nonzero().squeeze(1).tolist()
         init_states = (init_weights != semiring.zero.value).nonzero().squeeze(1).tolist()
 
-    fst = FST(semiring)
+    fst = FST(semiring, string_mapper=integerizer.__getitem__)
     init_state = fst.add_state()
     fst.set_initial_state(init_state)
 
@@ -658,9 +690,13 @@ def fromTransitions(
             cur_state = fst.add_state()
             fst_states[cur] = cur_state
 
+        if index_names is not None:
+            prev = integerizer.index(index_names[prev])
+            cur = integerizer.index(index_names[cur])
+
         fst.add_arc(
             prev_state, cur_state,
-            input_label=label_mapper(prev), output_label=label_mapper(cur),
+            input_label=prev, output_label=cur,
             weight=weight
         )
 
@@ -765,15 +801,19 @@ def leftToRightAcceptor(input_seq, semiring=None, string_mapper=None):
     return acceptor
 
 
-def sequenceFsa(seqs, integerizer):
+def sequenceFsa(seqs, integerizer=None):
+    if integerizer is None:
+        integerizer = HashableFstIntegerizer(tuple(itertools.chain(*seqs)))
+        seqs = tuple(map(integerizer.integerizeSequence, seqs))
+
     sequence_acceptor = FST(
-        semirings.TropicalSemiring, string_mapper=lambda i: str(integerizer[i])
+        semirings.TropicalSemiringWeight, string_mapper=lambda i: str(integerizer[i])
     ).create_from_string(seqs[0])
 
     for seq in seqs[1:]:
         sequence_acceptor = sequence_acceptor.union(
             FST(
-                semirings.TropicalSemiring, string_mapper=lambda i: str(integerizer[i])
+                semirings.TropicalSemiringWeight, string_mapper=lambda i: str(integerizer[i])
             ).create_from_string(seq)
         )
 
@@ -782,6 +822,63 @@ def sequenceFsa(seqs, integerizer):
 
 
 # -=( HELPER FUNCTIONS )==-----------------------------------------------------
+def smoothCounts(
+        edge_counts, state_counts, init_states, final_states,
+        # empty_regularizer=0, zero_transition_regularizer=0,
+        init_regularizer=0, final_regularizer=0,
+        uniform_regularizer=0, diag_regularizer=0,
+        override_transitions=False, structure_only=False):
+
+    num_states = max(state_counts.keys()) + 1
+
+    bigram_counts = torch.zeros((num_states, num_states))
+    for (i, j), count in edge_counts.items():
+        bigram_counts[i, j] = count
+
+    unigram_counts = torch.zeros(num_states)
+    for i, count in state_counts.items():
+        unigram_counts[i] = count
+
+    initial_counts = torch.zeros(num_states)
+    for i, count in init_states.items():
+        initial_counts[i] = count
+
+    final_counts = torch.zeros(num_states)
+    for i, count in final_states.items():
+        final_counts[i] = count
+
+    # Regularize the heck out of these counts
+    initial_states = initial_counts.nonzero()[:, 0]
+    for i in initial_states:
+        bigram_counts[i, i] += init_regularizer
+
+    final_states = final_counts.nonzero()[:, 0]
+    for i in final_states:
+        bigram_counts[i, i] += final_regularizer
+    # bigram_counts[:, 0] += zero_transition_regularizer
+    # bigram_counts[0, :] += zero_transition_regularizer
+    bigram_counts += uniform_regularizer
+    diag_indices = np.diag_indices(bigram_counts.shape[0])
+    bigram_counts[diag_indices] += diag_regularizer
+
+    if override_transitions:
+        logger.info('Overriding bigram_counts with an array of all ones')
+        bigram_counts = torch.ones_like(bigram_counts)
+
+    if structure_only:
+        bigram_counts = (bigram_counts > 0).float()
+        initial_counts = (initial_counts > 0).float()
+        final_counts = (final_counts > 0).float()
+
+    denominator = bigram_counts.sum(1)
+    transition_probs = bigram_counts / denominator[:, None]
+    transition_probs[torch.isnan(transition_probs)] = 0
+    initial_probs = initial_counts / initial_counts.sum()
+    final_probs = (final_counts > 0).float()
+
+    return transition_probs, initial_probs, final_probs
+
+
 def countSeqs(seqs):
     """ Count n-gram statistics on a collection of sequences.
 
