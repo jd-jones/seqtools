@@ -156,7 +156,8 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.num_obsv_dims = data[0].shape[1]
 
         if len(labels[0].shape) == 2:
-            self.num_label_types = labels[0].max() + 1
+            # self.num_label_types = labels[0].max() + 1
+            self.num_label_types = labels[0].shape[1]
         elif len(labels[0].shape) < 2:
             self.num_label_types = np.unique(np.hstack(labels)).max() + 1
         else:
