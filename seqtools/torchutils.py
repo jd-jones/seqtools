@@ -5,16 +5,22 @@ import numpy as np
 import torch
 import torch.utils.data
 
-try:
-    import torch_struct
-except ImportError:
-    pass
-
 
 from mathtools import utils
 
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    import torch_struct
+except ImportError:
+    torch_struct = None
+    logger.warning(
+        "No torch_struct installation detected "
+        "(This is fine if you won't use any structured models)"
+    )
+    pass
 
 
 # -=( MISC )==-----------------------------------------------------------------
