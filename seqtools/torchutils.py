@@ -4,7 +4,12 @@ import numpy as np
 
 import torch
 import torch.utils.data
-import torch_struct
+
+try:
+    import torch_struct
+except ImportError:
+    pass
+
 
 from mathtools import utils
 
@@ -234,7 +239,7 @@ def _viterbi_forward(self, log_potentials):
 
     argmax = torch.full(log_potentials.shape, dtype=torch.byte)
 
-    prev_score = None
+    # prev_score = None
     for start_idx in range(num_samples):
         for duration_idx in range(max_duration):
             if (start_idx + duration_idx) > num_samples:
