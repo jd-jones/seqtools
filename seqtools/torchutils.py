@@ -23,32 +23,6 @@ except ImportError:
     pass
 
 
-# -=( MISC )==-----------------------------------------------------------------
-def tensorFromSequence(sequence, **tensor_kwargs):
-    """ Stack each item of a sequence along the final dimension.
-
-    If the input has shape (num_features,), the output will have shape
-    (num_features, num_samples).
-
-    Parameters
-    ----------
-    sequence : iterable( numpy array )
-
-    Returns
-    -------
-    tensor : torch.Tensor, shape (..., num_samples)
-    """
-
-    after_last_dim = len(sequence[0].shape)
-
-    tensor = torch.stack(
-        tuple(torch.tensor(item, **tensor_kwargs) for item in sequence),
-        dim=after_last_dim
-    )
-
-    return tensor
-
-
 # -=( TRAINING & EVALUATION )=-------------------------------------------------
 def guessStructure(log_potentials):
     """ Guess the structure associated with a table of log potentials.
@@ -133,94 +107,6 @@ def fillSegments(pred_batch, in_place=False):
         for seg_start, next_seg_start in zip(segment_bounds[:-1], segment_bounds[1:]):
             seg_label = pred_batch[sample_index, seg_start]
             pred_batch[sample_index, seg_start:next_seg_start] = seg_label
-
-
-# -=( DATASETS )=--------------------------------------------------------------
-class SequenceDataset(torch.utils.data.Dataset):
-    """ A dataset wrapping sequences of numpy arrays stored in memory.
-
-    Attributes
-    ----------
-    _data : tuple(np.ndarray, shape (num_samples, num_dims))
-    _labels : tuple(np.ndarray, shape (num_samples,))
-    _device : torch.Device
-    """
-
-    def __init__(
-            self, data, labels, device=None, labels_dtype=None, sliding_window_args=None,
-            transpose_data=False):
-        """
-        Parameters
-        ----------
-        data : iterable( array_like of float, shape (sequence_len, num_dims) )
-        labels : iterable( array_like of int, shape (sequence_len,) )
-        device :
-        labels_dtype : torch data type
-            If passed, labels will be converted to this type
-        sliding_window_args : tuple(int, int, int), optional
-            A tuple specifying parameters for extracting sliding windows from
-            the data sequences. This should be ``(dimension, size, step)``---i.e.
-            the input to ``torch.unfold``. The label of each sliding window is
-            taken to be the median over the labels in that window.
-        """
-
-        self.num_obsv_dims = data[0].shape[1]
-
-        if len(labels[0].shape) == 2:
-            # self.num_label_types = labels[0].max() + 1
-            self.num_label_types = labels[0].shape[1]
-        elif len(labels[0].shape) < 2:
-            self.num_label_types = np.unique(np.hstack(labels)).max() + 1
-        else:
-            err_str = f"Labels have a weird shape: {labels[0].shape}"
-            raise ValueError(err_str)
-
-        self.sliding_window_args = sliding_window_args
-        self.transpose_data = transpose_data
-
-        self._device = device
-        self._labels_dtype = labels_dtype
-
-        self._data = data
-        self._labels = labels
-        self._data = tuple(map(lambda x: torch.tensor(x, device=device, dtype=torch.float), data))
-        self._labels = tuple(
-            map(lambda x: torch.tensor(x, device=device, dtype=labels_dtype), labels)
-        )
-
-        logger.info('Initialized ArrayDataset.')
-        logger.info(
-            f"Data has dimension {self.num_obsv_dims}; "
-            f"{self.num_label_types} unique labels"
-        )
-
-    def __len__(self):
-        return len(self._data)
-
-    def __getitem__(self, i):
-        # data_seq = torch.tensor(self._data[i], dtype=torch.float)
-        # label_seq = torch.tensor(self._labels[i])
-        data_seq = self._data[i]
-        label_seq = self._labels[i]
-
-        # if self._device is not None:
-        #     data_seq = data_seq.to(device=self._device)
-        #     label_seq = label_seq.to(device=self._device)
-
-        # if self._labels_type == 'float':
-        #     label_seq = label_seq.float()
-
-        # shape (sequence_len, num_dims) --> (num_dims, sequence_len)
-        if self.transpose_data:
-            data_seq = data_seq.transpose(0, 1)
-
-        if self.sliding_window_args is not None:
-            # Unfold gives shape (sequence_len, window_len);
-            # after transpose, data_seq has shape (window_len, sequence_len)
-            data_seq = data_seq.unfold(*self.sliding_window_args).transpose(-1, -2)
-            label_seq = label_seq.unfold(*self.sliding_window_args).median(dim=-1).values
-
-        return data_seq, label_seq
 
 
 # -=( MODELS )=----------------------------------------------------------------
@@ -910,7 +796,3 @@ class MarkovScorer(SemiMarkovScorer):
 
             log_potentials[:, sample_index, :, :] = scores
         return log_potentials
-
-
-class Hmm(torch_struct.HMM):
-    pass
