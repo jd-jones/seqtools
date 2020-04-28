@@ -827,7 +827,7 @@ def smoothCounts(
         # empty_regularizer=0, zero_transition_regularizer=0,
         init_regularizer=0, final_regularizer=0,
         uniform_regularizer=0, diag_regularizer=0,
-        override_transitions=False, structure_only=False):
+        override_transitions=False, structure_only=False, as_numpy=False):
 
     num_states = max(state_counts.keys()) + 1
 
@@ -875,6 +875,11 @@ def smoothCounts(
     transition_probs[torch.isnan(transition_probs)] = 0
     initial_probs = initial_counts / initial_counts.sum()
     final_probs = (final_counts > 0).float()
+
+    if as_numpy:
+        def to_numpy(x):
+            return x.numpy().astype(float)
+        return tuple(map(to_numpy, (transition_probs, initial_probs, final_probs)))
 
     return transition_probs, initial_probs, final_probs
 

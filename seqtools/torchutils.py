@@ -1,12 +1,12 @@
 import logging
 
-import numpy as np
-
 import torch
 import torch.utils.data
 
 
 from mathtools import utils
+
+from . import torch_lctm
 
 
 logger = logging.getLogger(__name__)
@@ -110,181 +110,6 @@ def fillSegments(pred_batch, in_place=False):
 
 
 # -=( MODELS )=----------------------------------------------------------------
-def _viterbi_forward(self, log_potentials):
-    """ Construct a table of semi-Markov (i.e. segmental) scores.
-
-    These scores can be used to instantiate pytorch-struct's SemiMarkovCRF.
-
-    Parameters
-    ----------
-    obsv : torch.Tensor of float, shape (batch_size, ..., num_samples)
-        NOTE: This method doesn't handle inputs with batch size > 1 (yet).
-
-    Returns
-    -------
-    log_potentials : torch.Tensor of float,
-            shape (batch_size, num_samples, max_duration, num_classes, num_classes)
-        [t, d, i, j] = score(x[t:t+d], s_j -> s_i)
-    """
-
-    batch_size, num_samples, max_duration, num_labels = log_potentials.shape[:-1]
-
-    argmax = torch.full(log_potentials.shape, dtype=torch.byte)
-
-    # prev_score = None
-    for start_idx in range(num_samples):
-        for duration_idx in range(max_duration):
-            if (start_idx + duration_idx) > num_samples:
-                break
-            for state_idx in range(num_labels):
-                log_potentials[:, start_idx, duration_idx, :, :]
-
-    return argmax
-
-
-def _dp_standard_lc(self, edge, lengths=None, force_grad=False):
-    semiring = self.semiring
-    ssize = semiring.size()
-    edge, batch, N, C, lengths = self._check_potentials(edge, lengths)
-
-    alpha = self._make_chart(N, (batch, C), edge, force_grad)
-    edge_store = self._make_chart(N - 1, (batch, C, C), edge, force_grad)
-
-    semiring.one_(alpha[0].data)
-
-    for n in range(1, N):
-        edge_store[n - 1][:] = semiring.times(
-            alpha[n - 1].view(ssize, batch, 1, C),
-            edge[:, :, n - 1].view(ssize, batch, C, C),
-        )
-        alpha[n][:] = semiring.sum(edge_store[n - 1])
-
-    for n in range(1, N):
-        edge_store[n - 1][:] = semiring.times(
-            alpha[n - 1].view(ssize, batch, 1, C),
-            edge[:, :, n - 1].view(ssize, batch, C, C),
-        )
-        alpha[n][:] = semiring.sum(edge_store[n - 1])
-
-    ret = [alpha[lengths[i] - 1][:, i] for i in range(batch)]
-    ret = torch.stack(ret, dim=1)
-    v = semiring.sum(ret)
-    return v, edge_store, alpha
-
-
-def _dp_backward_lc(self, edge, lengths, alpha_in, v=None):
-    def logdivide(a, b):
-        return (a - b)
-
-    semiring = self.semiring
-    _, batch, N, C, lengths = self._check_potentials(edge, lengths)
-
-    alpha = self._make_chart(N, (batch, C), edge, force_grad=False)
-    edge_store = self._make_chart(N - 1, (batch, C, C), edge, force_grad=False)
-
-    for n in range(N - 1, 0, -1):
-        for b, l in enumerate(lengths):
-            # alpha[l - 1][b].data.fill_(semiring.one_())
-            semiring.one_(alpha[l - 1][b].data)
-
-        edge_store[n - 1][:] = semiring.times(
-            alpha[n].view(batch, C, 1), edge[:, n - 1]
-        )
-        alpha[n - 1][:] = semiring.sum(edge_store[n - 1], dim=-2)
-    v = semiring.sum(
-        torch.stack([alpha[0][i] for i, l in enumerate(lengths)]), dim=-1
-    )
-    edge_marginals = self._make_chart(
-        1, (batch, N - 1, C, C), edge, force_grad=False
-    )[0]
-
-    for n in range(N - 1):
-        edge_marginals[0][:, n] = logdivide(
-            semiring.times(
-                alpha_in[n].view(batch, 1, C),
-                edge[:, n],
-                alpha[n + 1].view(batch, C, 1),
-            ),
-            v.view(batch, 1, 1),
-        )
-
-    return edge_marginals[0]
-
-
-def _dp_standard_sm(self, log_potentials, lengths=None, force_grad=False, return_marginals=False):
-    """ Standard dynamic program for semi-markov CRFs.
-
-    Copied from pytorch_struct.semimarkov.py.
-
-    This algorithm has worse runtime complexity than pytorch_struct's builtin
-    method _dp, but it has better memory complexity. Useful for decoding long
-    sequences (i.e. video streams instead of sentences).
-
-    Parameters
-    ----------
-    log_potentials : torch.tensor of float, shape (n_batch, n_samples, max_dur, n_class, n_class)
-
-    Returns
-    -------
-    v :
-    ??? : list(tensor)
-        A list containing only one element --- the input, `log_potentials`.
-    beta :
-        Weight of all paths finishing at sample N, with label C.
-    """
-    semiring = self.semiring
-    ssize = semiring.size()
-    log_potentials, batch, N, K, C, lengths = self._check_potentials(log_potentials, lengths)
-    log_potentials.requires_grad_(True)
-
-    # Init
-    #   alpha: All paths starting at N of len K
-    #   beta:  All paths finishing at N with label C
-    alpha = self._make_chart(1, (batch, N, K, C), log_potentials, force_grad)[0]
-    beta = self._make_chart(N, (batch, C), log_potentials, force_grad)
-    semiring.one_(beta[0].data)
-
-    # Main
-    for n in range(1, N):
-        alpha[:, :, n - 1] = semiring.dot(
-            beta[n - 1].view(ssize, batch, 1, 1, C),
-            log_potentials[:, :, n - 1].view(ssize, batch, K, C, C),
-        )
-
-        t = max(n - K, -1)
-        f1 = torch.arange(n - 1, t, -1)
-        f2 = torch.arange(1, len(f1) + 1)
-        beta[n][:] = semiring.sum(
-            torch.stack([alpha[:, :, a, b] for a, b in zip(f1, f2)], dim=-1)
-        )
-    v = semiring.sum(
-        torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1)
-    )
-
-    if return_marginals:
-        def logdivide(a, b):
-            return (a - b)
-        edge_marginals = self._make_chart(
-            1, (batch, N - 1, K, C, C), log_potentials, force_grad=False
-        )[0]
-
-        for n in range(N - 1):
-            k_max = min(K, N - n)
-            for k in range(k_max):
-                edge_marginals[0][:, n, k] = logdivide(
-                    semiring.times(
-                        alpha[:, :, n, k].view(batch, 1, C),
-                        log_potentials[:, :, n, k],
-                        beta[n + k].view(batch, C, 1),
-                    ),
-                    v.view(batch, 1, 1),
-                )
-        return v, [log_potentials], edge_marginals[0]
-
-    # pdb.set_trace()
-    return v, [log_potentials], beta
-
-
 class LinearChainScorer(object):
     """ Pytorch mixin that creates a linear-chain score table.
 
@@ -796,3 +621,258 @@ class MarkovScorer(SemiMarkovScorer):
 
             log_potentials[:, sample_index, :, :] = scores
         return log_potentials
+
+
+class LeaSegmentalScorer(object):
+    def __init__(
+            self, *super_args, transition_probs=None, initial_probs=None, final_probs=None,
+            max_segs=None, update_transition_params=False, **super_kwargs):
+        """
+        Parameters
+        ----------
+        transition_probs : torch.Tensor of float, shape (num_classes, num_classes), optional
+            Element (i, j) corresponds to (cur segment == j, prev segment == i);
+        initial_probs : torch.Tensor of float, shape (num_classes,), optional
+        final_probs : torch.Tensor of float, shape (num_gestures,), optional
+        update_transition_params : bool, optional
+            If True, start, end, and transition weights will be updated during
+            training.
+        max_segs : int, optional
+        *super_args, **super_kwargs : optional
+            Remaining arguments are passed to super's init method.
+        """
+
+        super().__init__(*super_args, **super_kwargs)
+
+        self.update_transition_params = update_transition_params
+        self.max_segs = max_segs
+
+        if transition_probs is not None:
+            transition_weights = torch.tensor(transition_probs).float().log()
+            self.transition_weights = torch.nn.Parameter(
+                transition_weights, requires_grad=self.update_transition_params
+            )
+
+        if initial_probs is not None:
+            start_weights = torch.tensor(initial_probs).float().log()
+            self.start_weights = torch.nn.Parameter(
+                start_weights, requires_grad=self.update_transition_params
+            )
+
+        if final_probs is not None:
+            end_weights = torch.tensor(final_probs).float().log()
+            self.end_weights = torch.nn.Parameter(
+                end_weights, requires_grad=self.update_transition_params
+            )
+
+    def predict(self, data_scores):
+        """
+        Parameters
+        ----------
+        data_scores : torch.tensor of float, shape (batch_size, num_dims, seq_length)
+        """
+
+        preds = tuple(
+            torch_lctm.segmental_inference(
+                scores, self.max_segs,
+                pw=self.transition_weights
+            )
+            for scores in data_scores.transpose(1, 2)
+        )
+
+        # FIXME: should be a batch of sequences
+        return torch.stack(preds)
+
+    def nllloss(self, data_scores, y, reduction='mean'):
+        losses = tuple(
+            -torch_lctm.log_prob_eccv(
+                scores, y_i, self.max_segs,
+                pw=self.transition_weights
+            )
+            for scores, y_i in zip(data_scores.transpose(1, 2), y)
+        )
+
+        losses = torch.stack(losses)
+        if reduction == 'none':
+            return losses
+        if reduction == 'mean':
+            return losses.mean()
+        if reduction == 'sum':
+            return losses.sum()
+        raise ValueError()
+
+
+# -=( DP HELPER FUNCTIONS )==--------------------------------------------------
+def _viterbi_forward(self, log_potentials):
+    """ Construct a table of semi-Markov (i.e. segmental) scores.
+
+    These scores can be used to instantiate pytorch-struct's SemiMarkovCRF.
+
+    Parameters
+    ----------
+    obsv : torch.Tensor of float, shape (batch_size, ..., num_samples)
+        NOTE: This method doesn't handle inputs with batch size > 1 (yet).
+
+    Returns
+    -------
+    log_potentials : torch.Tensor of float,
+            shape (batch_size, num_samples, max_duration, num_classes, num_classes)
+        [t, d, i, j] = score(x[t:t+d], s_j -> s_i)
+    """
+
+    batch_size, num_samples, max_duration, num_labels = log_potentials.shape[:-1]
+
+    argmax = torch.full(log_potentials.shape, dtype=torch.byte)
+
+    # prev_score = None
+    for start_idx in range(num_samples):
+        for duration_idx in range(max_duration):
+            if (start_idx + duration_idx) > num_samples:
+                break
+            for state_idx in range(num_labels):
+                log_potentials[:, start_idx, duration_idx, :, :]
+
+    return argmax
+
+
+def _dp_standard_lc(self, edge, lengths=None, force_grad=False):
+    semiring = self.semiring
+    ssize = semiring.size()
+    edge, batch, N, C, lengths = self._check_potentials(edge, lengths)
+
+    alpha = self._make_chart(N, (batch, C), edge, force_grad)
+    edge_store = self._make_chart(N - 1, (batch, C, C), edge, force_grad)
+
+    semiring.one_(alpha[0].data)
+
+    for n in range(1, N):
+        edge_store[n - 1][:] = semiring.times(
+            alpha[n - 1].view(ssize, batch, 1, C),
+            edge[:, :, n - 1].view(ssize, batch, C, C),
+        )
+        alpha[n][:] = semiring.sum(edge_store[n - 1])
+
+    for n in range(1, N):
+        edge_store[n - 1][:] = semiring.times(
+            alpha[n - 1].view(ssize, batch, 1, C),
+            edge[:, :, n - 1].view(ssize, batch, C, C),
+        )
+        alpha[n][:] = semiring.sum(edge_store[n - 1])
+
+    ret = [alpha[lengths[i] - 1][:, i] for i in range(batch)]
+    ret = torch.stack(ret, dim=1)
+    v = semiring.sum(ret)
+    return v, edge_store, alpha
+
+
+def _dp_backward_lc(self, edge, lengths, alpha_in, v=None):
+    def logdivide(a, b):
+        return (a - b)
+
+    semiring = self.semiring
+    _, batch, N, C, lengths = self._check_potentials(edge, lengths)
+
+    alpha = self._make_chart(N, (batch, C), edge, force_grad=False)
+    edge_store = self._make_chart(N - 1, (batch, C, C), edge, force_grad=False)
+
+    for n in range(N - 1, 0, -1):
+        for b, l in enumerate(lengths):
+            # alpha[l - 1][b].data.fill_(semiring.one_())
+            semiring.one_(alpha[l - 1][b].data)
+
+        edge_store[n - 1][:] = semiring.times(
+            alpha[n].view(batch, C, 1), edge[:, n - 1]
+        )
+        alpha[n - 1][:] = semiring.sum(edge_store[n - 1], dim=-2)
+    v = semiring.sum(
+        torch.stack([alpha[0][i] for i, l in enumerate(lengths)]), dim=-1
+    )
+    edge_marginals = self._make_chart(
+        1, (batch, N - 1, C, C), edge, force_grad=False
+    )[0]
+
+    for n in range(N - 1):
+        edge_marginals[0][:, n] = logdivide(
+            semiring.times(
+                alpha_in[n].view(batch, 1, C),
+                edge[:, n],
+                alpha[n + 1].view(batch, C, 1),
+            ),
+            v.view(batch, 1, 1),
+        )
+
+    return edge_marginals[0]
+
+
+def _dp_standard_sm(self, log_potentials, lengths=None, force_grad=False, return_marginals=False):
+    """ Standard dynamic program for semi-markov CRFs.
+
+    Copied from pytorch_struct.semimarkov.py.
+
+    This algorithm has worse runtime complexity than pytorch_struct's builtin
+    method _dp, but it has better memory complexity. Useful for decoding long
+    sequences (i.e. video streams instead of sentences).
+
+    Parameters
+    ----------
+    log_potentials : torch.tensor of float, shape (n_batch, n_samples, max_dur, n_class, n_class)
+
+    Returns
+    -------
+    v :
+    ??? : list(tensor)
+        A list containing only one element --- the input, `log_potentials`.
+    beta :
+        Weight of all paths finishing at sample N, with label C.
+    """
+    semiring = self.semiring
+    ssize = semiring.size()
+    log_potentials, batch, N, K, C, lengths = self._check_potentials(log_potentials, lengths)
+    log_potentials.requires_grad_(True)
+
+    # Init
+    #   alpha: All paths starting at N of len K
+    #   beta:  All paths finishing at N with label C
+    alpha = self._make_chart(1, (batch, N, K, C), log_potentials, force_grad)[0]
+    beta = self._make_chart(N, (batch, C), log_potentials, force_grad)
+    semiring.one_(beta[0].data)
+
+    # Main
+    for n in range(1, N):
+        alpha[:, :, n - 1] = semiring.dot(
+            beta[n - 1].view(ssize, batch, 1, 1, C),
+            log_potentials[:, :, n - 1].view(ssize, batch, K, C, C),
+        )
+
+        t = max(n - K, -1)
+        f1 = torch.arange(n - 1, t, -1)
+        f2 = torch.arange(1, len(f1) + 1)
+        beta[n][:] = semiring.sum(
+            torch.stack([alpha[:, :, a, b] for a, b in zip(f1, f2)], dim=-1)
+        )
+    v = semiring.sum(
+        torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1)
+    )
+
+    if return_marginals:
+        def logdivide(a, b):
+            return (a - b)
+        edge_marginals = self._make_chart(
+            1, (batch, N - 1, K, C, C), log_potentials, force_grad=False
+        )[0]
+
+        for n in range(N - 1):
+            k_max = min(K, N - n)
+            for k in range(k_max):
+                edge_marginals[0][:, n, k] = logdivide(
+                    semiring.times(
+                        alpha[:, :, n, k].view(batch, 1, C),
+                        log_potentials[:, :, n, k],
+                        beta[n + k].view(batch, C, 1),
+                    ),
+                    v.view(batch, 1, 1),
+                )
+        return v, [log_potentials], edge_marginals[0]
+
+    # pdb.set_trace()
+    return v, [log_potentials], beta
