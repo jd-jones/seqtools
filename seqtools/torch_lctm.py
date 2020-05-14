@@ -1,6 +1,4 @@
 import torch
-# from numba import float64, jit, int16, boolean, int64, autojit
-# from numba import jit
 
 from mathtools import utils
 
@@ -81,7 +79,6 @@ def segmental_forward(x, max_dur, pw=None):
     return scores
 
 
-# @jit("float64[:,:](float64[:,:], int16, float64[:,:])")
 def segmental_viterbi(x, max_dur, pw=None):
     # From S&C NIPS 2004
     T, n_classes = x.shape
@@ -155,7 +152,6 @@ def segmental_viterbi(x, max_dur, pw=None):
     return scores
 
 
-# @jit("float64[:,:](float64[:,:], int16, float64[:,:])")
 def segmental_forward_normalized(x, max_segs, pw=None):
     """ This version maximizes!!! """
     # Assumes segment function is normalized by duration: f(x)= 1/d sum_t'=t^t+d x_t'
@@ -225,7 +221,6 @@ def log_prob_eccv(data_scores, y, max_segs, pw=None):
     return -y_score - log_Z
 
 
-# @jit("float64[:,:](float64[:,:], int16, float64[:,:])")
 def segmental_forward_eccv(x, max_segs, pw=None, semiring='tropical'):
     if torch.isnan(x).any():
         raise ValueError("x contains NaN values")
@@ -277,7 +272,6 @@ def segmental_forward_eccv(x, max_segs, pw=None, semiring='tropical'):
     return scores
 
 
-# @jit("int16[:,:](float64[:,:], float64[:,:])")
 def segmental_backward_eccv(scores, pw=None):
     n_segs, T, n_classes = scores.shape
 
@@ -323,7 +317,8 @@ def segmental_backward_eccv(scores, pw=None):
     return y_out
 
 
-def segmental_inference(x, max_segs, pw=None, normalized=False, verbose=False, return_scores=False):
+def segmental_inference(
+        x, max_segs=None, pw=None, normalized=False, verbose=False, return_scores=False):
     # Scores has shape (num_segs, num_samples, num_classes)
     scores = segmental_forward_eccv(x, max_segs, pw)
     y_out = segmental_backward_eccv(scores, pw)
@@ -336,7 +331,6 @@ def segmental_inference(x, max_segs, pw=None, normalized=False, verbose=False, r
     return y_out
 
 
-# @jit("float64[:,:](float64[:,:], int16, float64[:,:], float64[:], float64[:,:])")
 def segmental_forward_oracle(x, max_segs, pw, y_oracle, oracle_valid):
     # Assumes segment function is additive: f(x)=sum_t'=t^t+d x_t'
     T, n_classes = x.shape
