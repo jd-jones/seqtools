@@ -151,6 +151,26 @@ class LatticeCrf(object):
         raise NotImplementedError()
 
 
+class DurationCrf(LatticeCrf):
+    def __init__(self, labels, num_states=2, transition_weights=None, self_weights=None):
+        super().__init__()
+
+        if transition_weights is None:
+            transition_weights = [0.6] * num_states
+
+        if self_weights is None:
+            self_weights = [0.4] * num_states
+
+        dur_fsts = [
+            durationFst(
+                label, num_states,
+                transition_weights=transition_weights, self_weights=self_weights
+            )
+            for label in labels
+        ]
+        self._dur_fst = dur_fsts[0].union(dur_fsts[1:]).closure()
+
+
 # -=( MISC UTILS )==-----------------------------------------------------------
 def toTransitionSeq(state_seq):
     transition_seq = ((-1, state_seq[0]),) + tuple(zip(state_seq[:-1], state_seq[1:]))
@@ -404,33 +424,71 @@ def fromTransitions(
     return fst
 
 
-def leftToRightAcceptor(input_seq, semiring=None, string_mapper=None):
-    """ Construct a left-to-right finite-state acceptor from an input sequence.
+def durationFst(
+        label, num_states, transition_weights=None, self_weights=None,
+        arc_type='standard', symbol_table=None):
+    """ Construct a left-to-right WFST from an input sequence.
 
     The input is usually a sequence of segment-level labels, and this machine
     is used to align labels with sample-level scores.
 
     Parameters
     ----------
-    input_seq : iterable(int or string), optional
-    semiring : semirings.AbstractSemiring, optional
-        Default is semirings.BooleanSemiringWeight.
-    string_mapper : function, optional
-        A function that takes an integer as input and returns a string as output.
+    input_seq : iterable(int or string)
 
     Returns
     -------
-    acceptor : fsm.FST
-        A linear-chain finite-state acceptor with `num_states` states. Each state
+    fst : openfst.Fst
+        A linear-chain weighted finite-state transducer. Each state
         has one self-transition and one transition to its right neighbor. i.e.
-        the topology looks like this (self-loops are omitted in the diagram
-        below because they're hard to draw in ASCII style):
-
-            [START] s1 --> s2 --> s3 [END]
-
-        All edge weights are `semiring.one`.
+        the topology looks like this:
+                        __     __     __
+                        \/     \/     \/
+            [START] --> s1 --> s2 --> s3 --> [END]
     """
-    raise NotImplementedError()
+
+    if num_states < 1:
+        raise AssertionError(f"num_states = {num_states}, but should be >= 1)")
+
+    fst = openfst.VectorFst(arc_type=arc_type)
+    one = openfst.Weight.one(fst.weight_type())
+    zero = openfst.Weight.zero(fst.weight_type())
+
+    if transition_weights is None:
+        transition_weights = [one for __ in range(num_states)]
+
+    if self_weights is None:
+        self_weights = [one for __ in range(num_states)]
+
+    if symbol_table is not None:
+        fst.set_input_symbols(symbol_table)
+        fst.set_output_symbols(symbol_table)
+
+    init_state = fst.add_state()
+    fst.set_start(init_state)
+
+    cur_state = fst.add_state()
+    arc = openfst.Arc(EPSILON, label + 1, one, cur_state)
+    fst.add_arc(init_state, arc)
+
+    for i in range(num_states):
+        next_state = fst.add_state()
+
+        transition_weight = openfst.Weight(fst.weight_type(), transition_weights[i])
+        if transition_weight != zero:
+            arc = openfst.Arc(label + 1, EPSILON, transition_weight, next_state)
+            fst.add_arc(cur_state, arc)
+
+        self_weight = openfst.Weight(fst.weight_type(), self_weights[i])
+        if self_weight != zero:
+            arc = openfst.Arc(label + 1, EPSILON, self_weight, cur_state)
+            fst.add_arc(cur_state, arc)
+
+        cur_state = next_state
+
+    fst.set_final(cur_state, one)
+
+    return fst
 
 
 # -=( TRAINING )==-------------------------------------------------------------
