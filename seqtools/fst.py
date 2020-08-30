@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 EPSILON = 0
+EPSILON_STRING = 'ε'
 
 
 def __test(num_samples=5):
@@ -74,11 +75,13 @@ class LatticeCrf(object):
     def __init__(
             self, transition_weights=None, initial_weights=None, final_weights=None,
             update_method='simple'):
-        self._transition_weights = transition_weights
-        self._initial_weights = initial_weights
-        self._final_weights = final_weights
+        self._params = {
+            'transition': transition_weights,
+            'initial': initial_weights,
+            'final': final_weights
+        }
 
-        num_states = self._initial_weights.shape[0]
+        num_states = self._params['initial'].shape[0]
         self._transition_to_arc = {}
         for s_cur in range(num_states):
             for s_next in range(num_states):
@@ -96,38 +99,57 @@ class LatticeCrf(object):
         if observation_scores is None:
             observation_scores = self.score(train_samples)
 
+        obs_fsts = tuple(
+            fromArray(
+                scores.reshape(scores.shape[0], -1),
+                output_labels=self._transition_to_arc
+            )
+            for scores in observation_scores
+        )
+        obs_batch_fst = easyUnion(*obs_fsts, disambiguate=True)
+
         train_labels = tuple(
             [self._transition_to_arc[t] for t in toTransitionSeq(label)]
             for label in train_labels
         )
-        observation_fsts = tuple(
-            fromArray(scores.reshape(scores.shape[0], -1), output_labels=self._transition_to_arc)
-            for scores in observation_scores
-        )
         gt_fsts = tuple(
-            fromSequence(labels, symbol_table=o_fst.output_symbols())
-            for labels, o_fst in zip(train_labels, observation_fsts)
+            fromSequence(labels, symbol_table=obs_batch_fst.output_symbols())
+            for labels in train_labels
         )
+        gt_batch_fst = easyUnion(*gt_fsts, disambiguate=True)
 
         losses = []
+        params = []
         for i in range(num_epochs):
-            transition_fst = fromTransitions(
-                self._transition_weights, self._initial_weights, self._final_weights,
-                transition_ids=self._transition_to_arc
-            )
-            batch_loss, batch_grad = batchLoss(
-                gt_fsts, observation_fsts, transition_fst, self._arc_to_transition
-            )
+            seq_fst = seqFstToBatch(self._makeSeqFst(), gt_batch_fst)
+            denom_fst = openfst.compose(obs_batch_fst, seq_fst)
+            num_fst = openfst.compose(denom_fst, gt_batch_fst)
+            batch_loss, batch_arcgrad = fstProb(num_fst, denom_fst)
 
-            transition_grad, init_grad, final_grad = batch_grad
-            self._transition_weights = self._updateWeights(
-                self._transition_weights, transition_grad
-            )
-            self._initial_weights = self._updateWeights(self._initial_weights, init_grad)
-            self._final_weights = self._updateWeights(self._final_weights, final_grad)
-            losses.append(batch_loss)
+            param_gradient = self._backward(batch_arcgrad)
+            self._params = self._update_params(self._params, param_gradient)
 
-        return np.array(losses)
+            params.append(self._params.copy())
+            losses.append(float(batch_loss))
+
+        return np.array(losses), params
+
+    def _makeSeqFst(self):
+        transition_fst = fromTransitions(
+            self._params['transition'], self._params['initial'], self._params['final'],
+            transition_ids=self._transition_to_arc
+        )
+        return transition_fst
+
+    def _backward(self, batch_arcgrad):
+        param_gradient = seqGradient(batch_arcgrad, self._arc_to_transition)
+        return param_gradient
+
+    def _update_params(self, params, param_gradient, **update_kwargs):
+        updated = params.copy()
+        for name, gradient in param_gradient.items():
+            updated[name] = self._updateWeights(params[name], gradient, **update_kwargs)
+        return updated
 
     def predict(self, test_samples, observation_scores=None):
         if observation_scores is None:
@@ -161,14 +183,26 @@ class DurationCrf(LatticeCrf):
         if self_weights is None:
             self_weights = [0.4] * num_states
 
+        self._transition_weights = transition_weights
+        self._self_weights = self_weights
+        self._num_states = num_states
+        self._labels = labels
+
+    def _makeSeqFst(self):
         dur_fsts = [
             durationFst(
-                label, num_states,
-                transition_weights=transition_weights, self_weights=self_weights
+                label, self._num_states,
+                transition_weights=self._transition_weights, self_weights=self._self_weights
             )
-            for label in labels
+            for label in self._labels
         ]
-        self._dur_fst = dur_fsts[0].union(dur_fsts[1:]).closure()
+
+        dur_fst = dur_fsts[0].union(dur_fsts[1:]).closure(closure_plus=True)
+
+        return dur_fst
+
+    def _backward(self, batch_arcgrad):
+        raise NotImplementedError()
 
 
 # -=( MISC UTILS )==-----------------------------------------------------------
@@ -209,6 +243,50 @@ def iteratePaths(fst):
 def outputLabels(fst):
     for path in iteratePaths(fst):
         yield tuple(arc.olabel for arc in path)
+
+
+def easyUnion(*fsts, disambiguate=False):
+    union_fst = openfst.VectorFst(arc_type=fsts[0].arc_type())
+    union_fst.set_start(union_fst.add_state())
+
+    merged_input_symbols = fsts[0].input_symbols()
+    merged_output_symbols = fsts[0].output_symbols()
+    for fst in fsts:
+        merged_input_symbols = openfst.merge_symbol_table(
+            merged_input_symbols, fst.input_symbols()
+        )
+        merged_output_symbols = openfst.merge_symbol_table(
+            merged_output_symbols, fst.output_symbols()
+        )
+
+    union_fst.set_input_symbols(merged_input_symbols)
+    union_fst.set_output_symbols(merged_output_symbols)
+    for fst in fsts:
+        fst.set_input_symbols(merged_input_symbols)
+        fst.set_output_symbols(merged_output_symbols)
+
+    union_fst.union(*fsts)
+
+    if disambiguate:
+        for seq_index, __ in enumerate(fsts):
+            union_fst.mutable_input_symbols().add_symbol(f"seq{seq_index}")
+
+        for seq_index, __ in enumerate(fsts):
+            union_fst.mutable_output_symbols().add_symbol(f"seq{seq_index}")
+
+        seq_index = 0
+        arc_iterator = union_fst.mutable_arcs(union_fst.start())
+        while not arc_iterator.done():
+            arc = arc_iterator.value()
+
+            arc.ilabel = union_fst.input_symbols().find(f"seq{seq_index}")
+            arc.olabel = union_fst.output_symbols().find(f"seq{seq_index}")
+            arc_iterator.set_value(arc)
+
+            arc_iterator.next()
+            seq_index += 1
+
+    return union_fst
 
 
 # -=( CREATION AND CONVERSION )==----------------------------------------------
@@ -253,10 +331,12 @@ def fromArray(weights, final_weight=None, arc_type=None, input_labels=None, outp
             input_labels = {str(i): i for i in range(weights.shape[2])}
 
     input_table = openfst.SymbolTable()
+    input_table.add_symbol(EPSILON_STRING, key=EPSILON)
     for in_symbol, index in input_labels.items():
         input_table.add_symbol(str(in_symbol), key=index + 1)
 
     output_table = openfst.SymbolTable()
+    output_table.add_symbol(EPSILON_STRING, key=EPSILON)
     for out_symbol, index in output_labels.items():
         output_table.add_symbol(str(out_symbol), key=index + 1)
 
@@ -309,6 +389,10 @@ def fromArray(weights, final_weight=None, arc_type=None, input_labels=None, outp
             prev_state = cur_state
         fst.set_final(cur_state, final_weight)
 
+    if not fst.verify():
+        # raise openfst.FstError("fst.verify() returned False")
+        print("fst.verify() returned False")
+
     return fst
 
 
@@ -347,6 +431,9 @@ def fromSequence(seq, arc_type='standard', symbol_table=None):
 
     fst.set_final(cur_state, one)
 
+    if not fst.verify():
+        raise openfst.FstError("fst.verify() returned False")
+
     return fst
 
 
@@ -373,10 +460,12 @@ def fromTransitions(
             transition_ids[(-1, s)] = len(transition_ids)
 
     output_table = openfst.SymbolTable()
+    output_table.add_symbol(EPSILON_STRING, key=EPSILON)
     for transition, index in transition_ids.items():
         output_table.add_symbol(str(transition), key=index + 1)
 
     input_table = openfst.SymbolTable()
+    input_table.add_symbol(EPSILON_STRING, key=EPSILON)
     for transition, index in transition_ids.items():
         input_table.add_symbol(str(transition), key=index + 1)
 
@@ -420,6 +509,10 @@ def fromTransitions(
             if weight != zero:
                 arc = openfst.Arc(transition, transition, weight, next_state)
                 fst.add_arc(cur_state, arc)
+
+    if not fst.verify():
+        # raise openfst.FstError("fst.verify() returned False")
+        print("fst.verify() returned False")
 
     return fst
 
@@ -488,58 +581,106 @@ def durationFst(
 
     fst.set_final(cur_state, one)
 
+    if not fst.verify():
+        raise openfst.FstError("fst.verify() returned False")
+
     return fst
 
 
+def seqFstToBatch(seq_fst, gt_batch_fst):
+    seq_prime = seq_fst.copy()
+    one = openfst.Weight.one(seq_prime.weight_type())
+
+    seq_prime.set_input_symbols(gt_batch_fst.input_symbols())
+    seq_prime.set_output_symbols(gt_batch_fst.output_symbols())
+
+    old_start = seq_prime.start()
+    new_start = seq_prime.add_state()
+    for seq_index in range(gt_batch_fst.num_arcs(gt_batch_fst.start())):
+        input_label = seq_prime.input_symbols().find(f"seq{seq_index}")
+        output_label = seq_prime.output_symbols().find(f"seq{seq_index}")
+        arc = openfst.Arc(input_label, output_label, one, old_start)
+        seq_prime.add_arc(new_start, arc)
+    seq_prime.set_start(new_start)
+
+    return seq_prime
+
+
 # -=( TRAINING )==-------------------------------------------------------------
-def batchLoss(gt_fsts, observation_fsts, transition_fst, arc_to_transition):
-    batch_loss = 0
-    batch_gradient = None
-    for observation_fst, gt_fst in zip(observation_fsts, gt_fsts):
-        neg_log_prob, gradient = fstLogProb(
-            observation_fst, gt_fst, transition_fst, arc_to_transition
-        )
-
-        batch_loss += neg_log_prob
-        if batch_gradient is None:
-            batch_gradient = gradient
-        else:
-            batch_gradient = tuple(cur + new for cur, new in zip(batch_gradient, gradient))
-
-    return batch_loss, batch_gradient
-
-
 def gradientStep(weights, gradient, step_size=1e-3):
-    new_weights = weights + step_size * gradient
+    new_weights = weights - step_size * gradient
     return new_weights
 
 
 # -=( CRF/HMM ALGORITHMS )==---------------------------------------------------
-def fstLogProb(observation_fst, gt_fst, transition_fst, arc_to_transition):
-    denominator_graph = openfst.compose(observation_fst, transition_fst)
+def fstProb(numerator_graph, denominator_graph):
     denom_betas = backward(denominator_graph, neglog_to_log=True)
-    denom_weight = denom_betas[denominator_graph.start()]
-
-    numerator_graph = openfst.compose(denominator_graph, gt_fst)
     num_betas = backward(numerator_graph, neglog_to_log=True)
-    num_weight = num_betas[numerator_graph.start()]
 
     # LOSS FUNCTION
-    log_prob = -float(openfst.divide(num_weight, denom_weight))
+    denom_weight = denom_betas[denominator_graph.start()]
+    num_weight = num_betas[numerator_graph.start()]
+    # num_weight - denom_weight is the log-prob, so invert to get the prob in
+    # openfst's log semiring
+    neg_log_prob = openfst.divide(denom_weight, num_weight)
 
     # LOSS GRADIENT
     num_arcgrad = fstArcGradient(numerator_graph, betas=num_betas)
     denom_arcgrad = fstArcGradient(denominator_graph, betas=denom_betas)
-    num_seqgrad = seqGradient(num_arcgrad, arc_to_transition)
-    denom_seqgrad = seqGradient(denom_arcgrad, arc_to_transition)
-    seq_gradient = tuple(grad_n - grad_d for grad_n, grad_d in zip(num_seqgrad, denom_seqgrad))
+    arc_gradient = subtractArcs(num_arcgrad, denom_arcgrad)
 
-    return log_prob, seq_gradient
+    return neg_log_prob, arc_gradient
+
+
+def subtractArcs(numerator, denominator):
+    """
+    FIXME: This function should return an FST in the real semiring. But since
+        openfst's python wrapper only exposes the log and tropical semirings,
+        it returns a log-semiring FST whose weights are actually real-valued.
+    """
+
+    def findArc(target, candidates):
+        for candidate in candidates:
+            if candidate.ilabel == target.ilabel and candidate.olabel == target.olabel:
+                return candidate
+        raise ValueError("No candidate matches target!")
+
+    def subtractLogWeights(lhs, rhs):
+        difference = np.exp(-float(lhs)) - np.exp(-float(rhs))
+        return openfst.Weight(lhs.type(), difference)
+
+    difference = denominator.copy()
+    zero = openfst.Weight.zero(numerator.weight_type())
+
+    states = [(numerator.start(), difference.start())]
+    while states:
+        num_state, difference_state = states.pop()
+        num_weight = numerator.final(num_state)
+        denom_weight = difference.final(difference_state)
+        if denom_weight != zero or num_weight != zero:
+            difference_weight = subtractLogWeights(num_weight, denom_weight)
+            difference.set_final(difference_state, difference_weight)
+        for num_arc in numerator.arcs(num_state):
+            difference_arc_iterator = difference.mutable_arcs(difference_state)
+            difference_arc = findArc(num_arc, difference_arc_iterator)
+            difference_arc.weight = subtractLogWeights(num_arc.weight, difference_arc.weight)
+            difference_arc_iterator.set_value(difference_arc)
+
+            states.append((num_arc.nextstate, difference_arc.nextstate))
+
+    return difference
 
 
 def seqGradient(arc_gradient, arc_to_transition):
-    """ TODO: Generalize this so it maps arcs to their partial gradients """
+    """
+    TODO: Generalize this so it maps arcs to their partial gradients.
+    FIXME: arc_gradient is a log-semiring WFST whose weights are actually real-valued.
+    """
 
+    # NOTE: We assert that arc_gradient should be in the log semiring as a hack.
+    #    Actually it should be in the real semiring, but openfst's python wrapper
+    #    doesn't expose that one. arc_gradient's weights actually represent real
+    #    values.
     if arc_gradient.arc_type() != 'log':
         raise AssertionError()
 
@@ -555,9 +696,12 @@ def seqGradient(arc_gradient, arc_to_transition):
 
     for state in arc_gradient.states():
         for arc in arc_gradient.arcs(state):
-            prev_out, cur_out = arc_to_transition[arc.olabel - 1]
-            # Arc weights are negative log-probs, but we need probs for the gradient
-            arc_prob = np.exp(-float(arc.weight))
+            try:
+                prev_out, cur_out = arc_to_transition[arc.olabel - 1]
+            except KeyError:
+                continue
+
+            arc_prob = float(arc.weight)
             if state == arc_gradient.start():
                 initial_grad[cur_out] += arc_prob
             else:
@@ -565,11 +709,15 @@ def seqGradient(arc_gradient, arc_to_transition):
 
             next_final_weight = arc_gradient.final(arc.nextstate)
             if next_final_weight != zero:
-                # Arc weights are negative log-probs, but we need probs for the gradient
-                final_prob = np.exp(-float(next_final_weight))
+                final_prob = float(arc.weight)
                 final_grad[cur_out] += final_prob
 
-    return transition_grad, initial_grad, final_grad
+    param_gradient = {
+        'transition': transition_grad,
+        'initial': initial_grad,
+        'final': final_grad
+    }
+    return param_gradient
 
 
 def fstArcGradient(lattice, alphas=None, betas=None):
