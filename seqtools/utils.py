@@ -1,8 +1,19 @@
+import warnings
+import collections
+import logging
+
+import numpy as np
+from matplotlib import pyplot as plt
+
+
+logger = logging.getLogger(__name__)
+
+
 def smoothCounts(
         edge_counts, state_counts, init_states, final_states,
         init_regularizer=0, final_regularizer=0,
         uniform_regularizer=0, diag_regularizer=0,
-        override_transitions=False, structure_only=False, as_numpy=False):
+        override_transitions=False, structure_only=False, as_numpy=False, as_scores=False):
 
     num_states = max(state_counts.keys()) + 1
 
@@ -23,11 +34,11 @@ def smoothCounts(
         final_counts[i] = count
 
     # Regularize the heck out of these counts
-    initial_states = initial_counts.nonzero()[:, 0]
+    initial_states = initial_counts.nonzero()[0]
     for i in initial_states:
         bigram_counts[i, i] += init_regularizer
 
-    final_states = final_counts.nonzero()[:, 0]
+    final_states = final_counts.nonzero()[0]
     for i in final_states:
         bigram_counts[i, i] += final_regularizer
 
@@ -40,20 +51,29 @@ def smoothCounts(
         bigram_counts = np.ones_like(bigram_counts)
 
     if structure_only:
-        bigram_counts = (bigram_counts > 0).float()
-        initial_counts = (initial_counts > 0).float()
-        final_counts = (final_counts > 0).float()
+        bigram_counts = (bigram_counts > 0).astype(float)
+        initial_counts = (initial_counts > 0).astype(float)
+        final_counts = (final_counts > 0).astype(float)
 
     denominator = bigram_counts.sum(1)
     transition_probs = bigram_counts / denominator[:, None]
     transition_probs[np.isnan(transition_probs)] = 0
     initial_probs = initial_counts / initial_counts.sum()
-    final_probs = (final_counts > 0).float()
+
+    # FIXME: these aren't the real final probs in general
+    final_probs = (final_counts > 0).astype(float)
 
     if as_numpy:
         def to_numpy(x):
             return x.numpy().astype(float)
         return tuple(map(to_numpy, (transition_probs, initial_probs, final_probs)))
+
+    if as_scores:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='divide by zero')
+            transition_probs = np.log(transition_probs)
+            initial_probs = np.log(initial_probs)
+            final_probs = np.log(final_probs)
 
     return transition_probs, initial_probs, final_probs
 
@@ -87,3 +107,11 @@ def countSeqs(seqs):
             bigram_counts[prev, cur] += 1
 
     return bigram_counts, unigram_counts, initial_counts, final_counts
+
+
+def plot_transitions(fn, transition_probs, initial_probs, final_probs):
+    plt.figure()
+    plt.matshow(transition_probs)
+    plt.title('Transitions')
+    plt.savefig(fn)
+    plt.close()
