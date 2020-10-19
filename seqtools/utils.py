@@ -10,12 +10,13 @@ logger = logging.getLogger(__name__)
 
 
 def smoothCounts(
-        edge_counts, state_counts, init_states, final_states,
+        edge_counts, state_counts, init_states, final_states, num_states=None,
         init_regularizer=0, final_regularizer=0,
         uniform_regularizer=0, diag_regularizer=0,
         override_transitions=False, structure_only=False, as_numpy=False, as_scores=False):
 
-    num_states = max(state_counts.keys()) + 1
+    if num_states is None:
+        num_states = max(state_counts.keys()) + 1
 
     bigram_counts = np.zeros((num_states, num_states))
     for (i, j), count in edge_counts.items():
