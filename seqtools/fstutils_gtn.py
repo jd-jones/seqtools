@@ -1,6 +1,8 @@
 import logging
+import os
 
 import numpy as np
+import torch
 import gtn
 
 
@@ -8,7 +10,19 @@ logger = logging.getLogger(__name__)
 
 
 EPSILON = gtn.epsilon
+BOS = EPSILON - 1
+EOS = BOS - 1
 EPSILON_STRING = 'ε'
+BOS_STRING = '<bos>'
+EOS_STRING = '<eos>'
+
+
+def vocab_mapper(base=None):
+    mapper = {EPSILON: EPSILON_STRING, BOS: BOS_STRING, EOS: EOS_STRING}
+    if base is not None:
+        mapper.update(base)
+    return mapper
+
 
 zero = -np.inf
 one = 0
@@ -64,7 +78,7 @@ def __test(num_samples=5):
         for s_next in range(num_states):
             transition_to_arc[(s_cur, s_next)] = len(transition_to_arc)
     for s in range(num_states):
-        transition_to_arc[(-1, s)] = len(transition_to_arc)
+        transition_to_arc[(BOS, s)] = len(transition_to_arc)
     arc_to_transition = {v: k for k, v in transition_to_arc.items()}
 
     seq_params = (transition, initial, final)
@@ -74,49 +88,77 @@ def __test(num_samples=5):
     return seq_params, simulated_dataset, arc_to_transition, transition_to_arc
 
 
-class LatticeCrf(object):
-    def __init__(self, transition_weights=None, initial_weights=None, final_weights=None):
+def __test_basic(base_dir=None, draw=False):
+    if base_dir is None:
+        base_dir = os.path.expanduser('~')
+
+    vocabulary = ['a', 'b', 'c', 'd', 'e', 'f']
+    vocab_size = len(vocabulary)
+    transitions = np.random.randn(vocab_size, vocab_size)
+    transition_vocab, transition_ids = makeTransitionVocabulary(transitions)
+
+    seq = range(vocab_size)
+    seq_transitions = [transition_ids[t] for t in toTransitionSeq(seq)]
+    seq_fst = fromSequence(seq_transitions)
+
+    num_samples = len(seq_transitions) - 2
+    # samples_mapper = vocab_mapper({i: str(i) for i in range(num_samples)})
+    seq_mapper = vocab_mapper({i: s for i, s in enumerate(vocabulary)})
+    tx_mapper = vocab_mapper(
+        {i: ','.join((seq_mapper[j] for j in t)) for i, t in enumerate(transition_vocab)}
+    )
+
+    tx_fst = fromTransitions(transitions, transition_ids=transition_ids)
+
+    scores = torch.tensor(np.random.randn(num_samples, vocab_size ** 2))
+    scores_fst = linearFstFromArray(scores)
+
+    denom = gtn.compose(scores_fst, tx_fst)
+    num = gtn.compose(denom, seq_fst)
+
+    fsts = (scores_fst, tx_fst, seq_fst, denom, num)
+    names = ('SCORES', 'TRANSITIONS', 'SEQUENCE', 'DENOMINATOR', 'NUMERATOR')
+
+    if draw:
+        for fst, name in zip(fsts, names):
+            gtn.draw(
+                fst, os.path.join(base_dir, f'TEST_FROM{name}.png'),
+                isymbols=tx_mapper, osymbols=tx_mapper
+            )
+
+    return fsts, names
+
+
+class LatticeCrf(torch.nn.Module):
+    def __init__(
+            self, vocabulary,
+            transition_weights=None, initial_weights=None, final_weights=None,
+            requires_grad=True):
         super().__init__()
 
-        self._params = {
-            'transition': transition_weights,
-            'initial': initial_weights,
-            'final': final_weights
-        }
+        self._vocabulary = vocabulary
+        self._vocab_size = len(vocabulary)
 
-        num_states = self._params['initial'].shape[0]
-        self._transition_to_arc = {}
-        for s_cur in range(num_states):
-            for s_next in range(num_states):
-                self._transition_to_arc[(s_cur, s_next)] = len(self._transition_to_arc)
-        for s in range(num_states):
-            self._transition_to_arc[(-1, s)] = len(self._transition_to_arc)
-        self._arc_to_transition = {v: k for k, v in self._transition_to_arc.items()}
+        if transition_weights is None:
+            transition_weights = torch.zeros(self._vocab_size, self._vocab_size, dtype=torch.float)
 
-    def fit(self, train_samples, train_labels, observation_scores=None, num_epochs=1):
-        if observation_scores is None:
-            observation_scores = self.score(train_samples)
+        if initial_weights is None:
+            initial_weights = torch.zeros(self._vocab_size, dtype=torch.float)
 
-        obs_fsts = tuple(
-            fromArray(scores.reshape(scores.shape[0], -1))
-            for scores in observation_scores
+        if final_weights is None:
+            final_weights = torch.zeros(self._vocab_size, dtype=torch.float)
+
+        self._params = torch.nn.ParameterDict({
+            'transition': torch.nn.Parameter(transition_weights, requires_grad=requires_grad),
+            'initial': torch.nn.Parameter(initial_weights, requires_grad=requires_grad),
+            'final': torch.nn.Parameter(final_weights, requires_grad=requires_grad)
+        })
+
+        self._arc_to_transition, self._transition_to_arc = makeTransitionVocabulary(
+            transition_weights
         )
 
-        train_labels = tuple(
-            [self._transition_to_arc[t] for t in toTransitionSeq(label)]
-            for label in train_labels
-        )
-        gt_fsts = tuple(
-            fromSequence(labels)
-            for labels in train_labels
-        )
-
-        losses, params = self._fit(obs_fsts, gt_fsts)
-
-        return losses, params
-
-    def _fit(self, obs_fsts, gt_fsts):
-        raise NotImplementedError()
+        self._seq_fst = self._makeSeqFst()
 
     def _makeSeqFst(self):
         transition_fst = fromTransitions(
@@ -125,26 +167,79 @@ class LatticeCrf(object):
         )
         return transition_fst
 
-    def predict(self, test_samples, observation_scores=None):
-        if observation_scores is None:
-            observation_scores = self.score(test_samples)
+    def nllLoss(self, inputs, targets):
+        arc_labels = torch.tensor([
+            [self._transition_to_arc[t] for t in toTransitionSeq(label_seq.tolist())]
+            for label_seq in targets
+        ])
 
-        transition_fst = fromArray(self._transition_weights)
-        observation_fsts = tuple(
-            fromArray(scores.reshape(scores.shape[0], -1))
-            for scores in observation_scores
-        )
+        log_probs = self.log_prob(inputs, arc_labels)
+        nll_loss = -log_probs.sum()
+        return nll_loss
 
-        all_preds = []
-        for observation_fst in observation_fsts:
-            decode_graph = gtn.compose(observation_fst, transition_fst)
-            pred_labels = viterbi(decode_graph)
-            all_preds.append(pred_labels)
+    def log_prob(self, arc_scores, arc_labels):
+        device = arc_scores.device
+        arc_scores = arc_scores.cpu()
+        arc_labels = arc_labels.cpu()
 
-        return all_preds
+        batch_size, num_samples, num_classes = arc_scores.shape
 
-    def score(self, train_samples):
-        raise NotImplementedError()
+        losses = [None] * batch_size
+        obs_fsts = [None] * batch_size
+
+        def seq_loss(batch_index):
+            obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
+            gt_fst = fromSequence(arc_labels[batch_index])
+
+            # FIXME: obs FST not compatible with seq FST (but gt FST is)
+            denom_fst = gtn.compose(obs_fst, self._seq_fst)
+            num_fst = gtn.compose(denom_fst, gt_fst)
+            import pdb; pdb.set_trace()
+
+            # log(denom_score) - log(num_score) = - log(num_score / denom_score)
+            loss = gtn.subtract(
+                gtn.forward_score(denom_fst),
+                gtn.forward_score(num_fst)
+            )
+
+            losses[batch_index] = loss
+            obs_fsts[batch_index] = obs_fst
+
+        # gtn.parallel_for(seq_loss, range(batch_size))
+        losses = [seq_loss(i) for i in range(batch_size)]
+        losses = torch.tensor([lp.item() for lp in losses]).to(device)
+
+        # self.auxiliary_data = (losses, obs_fsts, arc_scores.shape)
+
+        return losses
+
+    def predict(self, arc_scores):
+        device = arc_scores.device
+        arc_scores = arc_scores.cpu()
+
+        batch_size, num_samples, num_classes = arc_scores.shape
+
+        best_paths = [None] * batch_size
+
+        def pred_seq(batch_index):
+            obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
+            denom_fst = gtn.compose(obs_fst, self._seq_fst)
+            best_paths[batch_index] = gtn.viterbi_path(denom_fst)
+
+        gtn.parallel_for(pred_seq, range(batch_size))
+
+        best_paths = torch.tensor([self._getOutputString(p) for p in best_paths]).to(device)
+        return best_paths
+
+    def _getOutputString(self, path):
+        arc_labels = path.labels_to_list(ilabel=False)
+        transition_seq = tuple(self._arc_to_transition[a] for a in arc_labels)
+        seq = toStateSeq(transition_seq)
+        return seq
+
+    def forward(self, inputs):
+        outputs = inputs
+        return outputs
 
 
 class DurationCrf(LatticeCrf):
@@ -168,31 +263,17 @@ class DurationCrf(LatticeCrf):
 
 # -=( MISC UTILS )==-----------------------------------------------------------
 def toTransitionSeq(state_seq):
-    transition_seq = ((-1, state_seq[0]),) + tuple(zip(state_seq[:-1], state_seq[1:]))
+    transition_seq = (
+        ((BOS, state_seq[0]),)
+        + tuple(zip(state_seq[:-1], state_seq[1:]))
+        + ((state_seq[-1], EOS),)
+    )
     return transition_seq
 
 
 def toStateSeq(transition_seq):
-    state_seq = tuple(transition[1] for transition in transition_seq)
+    state_seq = tuple(transition[1] for transition in transition_seq[:-1])
     return state_seq
-
-
-def iteratePaths(fst):
-    paths = [tuple(fst.arcs(fst.start()))]
-    while paths:
-        path = paths.pop()
-        state = path[-1].nextstate
-        if state == -1:
-            yield path
-
-        for arc in fst.arcs(state):
-            new_path = path + (arc,)
-            paths.append(new_path)
-
-
-def outputLabels(fst):
-    for path in iteratePaths(fst):
-        yield tuple(arc.olabel for arc in path)
 
 
 # -=( CREATION AND CONVERSION )==----------------------------------------------
@@ -243,7 +324,7 @@ def fromArray(weights, final_weight=None, calc_grad=True):
     if is_lattice:
         prev_state = init_state
         for sample_index, row in enumerate(weights):
-            cur_state = fst.add_state()
+            cur_state = fst.add_node()
             for i, weight in enumerate(row):
                 input_label_index = sample_index
                 output_label_index = i
@@ -263,7 +344,7 @@ def fromArray(weights, final_weight=None, calc_grad=True):
     else:
         prev_state = init_state
         for sample_index, input_output in enumerate(weights):
-            cur_state = fst.add_state()
+            cur_state = fst.add_node()
             for i, outputs in enumerate(input_output):
                 for j, weight in enumerate(outputs):
                     input_label_index = i
@@ -296,7 +377,7 @@ def fromSequence(seq, is_acceptor=True, calc_grad=True):
 
     prev_state = init_state
     for sample_index, label_index in enumerate(seq):
-        cur_state = fst.add_state()
+        cur_state = fst.add_node()
         fst.add_arc(prev_state, cur_state, label_index)
         prev_state = cur_state
     fst.add_arc(cur_state, final_state, gtn.epsilon)
@@ -316,6 +397,23 @@ def toArray(lattice):
     return weights, lattice.weight_type()
 
 
+def makeTransitionVocabulary(transition_weights):
+    num_states = transition_weights.shape[0]
+
+    transition_vocab = []
+    for s_cur in range(num_states):
+        for s_next in range(num_states):
+            transition_vocab.append((s_cur, s_next))
+    for s in range(num_states):
+        transition_vocab.append((BOS, s))
+    for s in range(num_states):
+        transition_vocab.append((s, EOS))
+
+    transition_ids = {t: i for i, t in enumerate(transition_vocab)}
+
+    return transition_vocab, transition_ids
+
+
 def fromTransitions(
         transition_weights, init_weights=None, final_weights=None,
         transition_ids=None, calc_grad=True):
@@ -331,12 +429,7 @@ def fromTransitions(
     num_states = transition_weights.shape[0]
 
     if transition_ids is None:
-        transition_ids = {}
-        for s_cur in range(num_states):
-            for s_next in range(num_states):
-                transition_ids[(s_cur, s_next)] = len(transition_ids)
-        for s in range(num_states):
-            transition_ids[(-1, s)] = len(transition_ids)
+        _, transition_ids = makeTransitionVocabulary(transition_weights)
 
     if init_weights is None:
         init_weights = tuple(float(one) for __ in range(num_states))
@@ -349,16 +442,17 @@ def fromTransitions(
     final_state = fst.add_node(accept=True)
 
     def makeState(i):
-        transition_id = transition_ids[-1, i]
-        state = fst.add_state()
+        state = fst.add_node()
 
+        transition_id = transition_ids[BOS, i]
         initial_weight = init_weights[i]
         if initial_weight != zero:
             fst.add_arc(init_state, state, gtn.epsilon, transition_id, initial_weight)
 
+        transition_id = transition_ids[i, EOS]
         final_weight = final_weights[i]
         if final_weight != zero:
-            fst.add_arc(state, final_state, gtn.epsilon, gtn.epsilon, final_weight)
+            fst.add_arc(state, final_state, gtn.epsilon, transition_id, final_weight)
 
         return state
 
