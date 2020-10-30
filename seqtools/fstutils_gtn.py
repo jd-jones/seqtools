@@ -28,66 +28,6 @@ zero = -np.inf
 one = 0
 
 
-def __test(num_samples=5):
-    def sampleGT(transition_probs, initial_probs):
-        cur_state = np.random.choice(initial_probs.shape[0], p=initial_probs)
-        gt_seq = [cur_state]
-        while True:
-            transitions = transition_probs[cur_state, :]
-            cur_state = np.random.choice(transitions.shape[0], p=transitions)
-            if cur_state == transitions.shape[0] - 1:
-                return gt_seq
-            gt_seq.append(cur_state)
-
-    def sampleScores(gt_seq, num_states):
-        """ score[i, j, k] := weight(sample i | state j -> state k) """
-        num_samples = len(gt_seq) - 1
-        scores = np.random.random_sample(size=(num_samples, num_states, num_states))
-        return scores
-
-    def samplePair(transition_probs, initial_probs):
-        gt_seq = sampleGT(transition_probs, initial_probs)
-        score_seq = sampleScores(gt_seq, initial_probs.shape[0])
-        return gt_seq, score_seq
-
-    def simulate(num_samples, transition, initial, final):
-        transition_probs = np.hstack((transition, final[:, None]))
-        transition_probs /= transition_probs.sum(axis=1)[:, None]
-        initial_probs = initial.copy()
-        initial_probs /= initial_probs.sum()
-
-        simulated_dataset = tuple(
-            samplePair(transition_probs, initial_probs)
-            for __ in range(num_samples)
-        )
-        return simulated_dataset
-
-    transition = np.array(
-        [[0, 1, 0, 0, 0],
-         [0, 0, 1, 1, 0],
-         [0, 0, 0, 0, 1],
-         [0, 1, 0, 0, 1],
-         [0, 0, 0, 0, 0]], dtype=float
-    )
-    initial = np.array([1, 0, 1, 0, 0], dtype=float)
-    final = np.array([0, 1, 0, 0, 1], dtype=float) / 10
-
-    num_states = len(initial)
-    transition_to_arc = {}
-    for s_cur in range(num_states):
-        for s_next in range(num_states):
-            transition_to_arc[(s_cur, s_next)] = len(transition_to_arc)
-    for s in range(num_states):
-        transition_to_arc[(BOS, s)] = len(transition_to_arc)
-    arc_to_transition = {v: k for k, v in transition_to_arc.items()}
-
-    seq_params = (transition, initial, final)
-    simulated_dataset = simulate(num_samples, *seq_params)
-    seq_params = tuple(map(lambda x: -np.log(x), seq_params))
-
-    return seq_params, simulated_dataset, arc_to_transition, transition_to_arc
-
-
 def __test_basic(base_dir=None, draw=False):
     if base_dir is None:
         base_dir = os.path.expanduser('~')
@@ -133,7 +73,7 @@ class LatticeCrf(torch.nn.Module):
     def __init__(
             self, vocabulary,
             transition_weights=None, initial_weights=None, final_weights=None,
-            requires_grad=True):
+            requires_grad=True, debug_output_dir=None):
         super().__init__()
 
         self._vocabulary = vocabulary
@@ -157,8 +97,20 @@ class LatticeCrf(torch.nn.Module):
         self._arc_to_transition, self._transition_to_arc = makeTransitionVocabulary(
             transition_weights
         )
+        self._arc_symbols = {
+            arc_idx: ','.join([str(self._vocabulary[state_idx]) for state_idx in state_pair])
+            for arc_idx, state_pair in enumerate(self._arc_to_transition)
+        }
 
         self._seq_fst = self._makeSeqFst()
+
+        self._debug_output_dir = debug_output_dir
+
+        if self._debug_output_dir is not None:
+            gtn.draw(
+                self._seq_fst, os.path.join(self._debug_output_dir, 'seq.png'),
+                isymbols=self._arc_symbols, osymbols=self._arc_symbols
+            )
 
     def _makeSeqFst(self):
         transition_fst = fromTransitions(
@@ -167,18 +119,44 @@ class LatticeCrf(torch.nn.Module):
         )
         return transition_fst
 
-    def nllLoss(self, inputs, targets):
-        arc_labels = torch.tensor([
-            [self._transition_to_arc[t] for t in toTransitionSeq(label_seq.tolist())]
-            for label_seq in targets
+    def labels_to_arc(self, labels):
+        arc_labels = torch.stack([
+            torch.tensor([
+                self._transition_to_arc[t]
+                for t in toTransitionSeq(label_seq.tolist())
+            ])
+            for label_seq in labels
         ])
+        return arc_labels
 
-        log_probs = self.log_prob(inputs, arc_labels)
-        nll_loss = -log_probs.sum()
-        return nll_loss
+    def scores_to_arc(self, scores):
+        arc_scores = torch.stack([
+            x.view(x.shape[0], -1)
+            for x in scores
+        ])
+        return arc_scores
 
-    def log_prob(self, arc_scores, arc_labels):
-        device = arc_scores.device
+    def nllLoss(self, inputs, targets):
+        raise NotImplementedError()
+
+    def log_prob(self, inputs, targets):
+        class GtnNllLoss(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, inputs, targets):
+                losses = self._log_prob(inputs, targets)
+                return losses
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return self._log_prob_gradient()
+
+        return GtnNllLoss.apply(inputs, targets)
+
+    def _log_prob(self, inputs, targets):
+        device = inputs.device
+        arc_scores = self.scores_to_arc(inputs)
+        arc_labels = self.labels_to_arc(targets)
+
         arc_scores = arc_scores.cpu()
         arc_labels = arc_labels.cpu()
 
@@ -191,29 +169,33 @@ class LatticeCrf(torch.nn.Module):
             obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
             gt_fst = fromSequence(arc_labels[batch_index])
 
-            # FIXME: obs FST not compatible with seq FST (but gt FST is)
             denom_fst = gtn.compose(obs_fst, self._seq_fst)
             num_fst = gtn.compose(denom_fst, gt_fst)
-            import pdb; pdb.set_trace()
 
-            # log(denom_score) - log(num_score) = - log(num_score / denom_score)
             loss = gtn.subtract(
-                gtn.forward_score(denom_fst),
-                gtn.forward_score(num_fst)
+                gtn.forward_score(num_fst),
+                gtn.forward_score(denom_fst)
             )
 
             losses[batch_index] = loss
             obs_fsts[batch_index] = obs_fst
 
-        # gtn.parallel_for(seq_loss, range(batch_size))
-        losses = [seq_loss(i) for i in range(batch_size)]
-        losses = torch.tensor([lp.item() for lp in losses]).to(device)
+        gtn.parallel_for(seq_loss, range(batch_size))
 
-        # self.auxiliary_data = (losses, obs_fsts, arc_scores.shape)
+        losses = torch.tensor([lp.item() for lp in losses]).to(device)
+        self.auxiliary_data = (losses, obs_fsts, arc_scores.shape)
 
         return losses
 
-    def predict(self, arc_scores):
+    def _log_prob_gradient(self):
+        raise NotImplementedError()
+
+    def predict(self, inputs):
+        return self.argmax(inputs)
+
+    def argmax(self, inputs):
+        arc_scores = self.scores_to_arc(inputs)
+
         device = arc_scores.device
         arc_scores = arc_scores.cpu()
 
