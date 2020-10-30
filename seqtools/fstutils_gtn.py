@@ -102,23 +102,6 @@ class LatticeCrf(torch.nn.Module):
             for arc_idx, state_pair in enumerate(self._arc_to_transition)
         }
 
-        self._seq_fst = self._makeSeqFst()
-
-        self._debug_output_dir = debug_output_dir
-
-        if self._debug_output_dir is not None:
-            gtn.draw(
-                self._seq_fst, os.path.join(self._debug_output_dir, 'seq.png'),
-                isymbols=self._arc_symbols, osymbols=self._arc_symbols
-            )
-
-    def _makeSeqFst(self):
-        transition_fst = fromTransitions(
-            self._params['transition'], self._params['initial'], self._params['final'],
-            transition_ids=self._transition_to_arc
-        )
-        return transition_fst
-
     def labels_to_arc(self, labels):
         arc_labels = torch.stack([
             torch.tensor([
@@ -137,22 +120,28 @@ class LatticeCrf(torch.nn.Module):
         return arc_scores
 
     def nllLoss(self, inputs, targets):
-        raise NotImplementedError()
+        return self.log_prob(inputs, targets)
 
     def log_prob(self, inputs, targets):
         class GtnNllLoss(torch.autograd.Function):
             @staticmethod
-            def forward(ctx, inputs, targets):
-                losses = self._log_prob(inputs, targets)
+            def forward(ctx, inputs, targets, w_t, w_i, w_f):
+                losses = self._log_prob(inputs, targets, w_t, w_i, w_f)
                 return losses
 
             @staticmethod
             def backward(ctx, grad_output):
-                return self._log_prob_gradient()
+                return self._log_prob_gradient(grad_output)
 
-        return GtnNllLoss.apply(inputs, targets)
+        logprob = GtnNllLoss.apply(
+            inputs, targets,
+            self._params['transition'], self._params['initial'], self._params['final']
+        )
+        return logprob
 
-    def _log_prob(self, inputs, targets):
+    def _log_prob(self, inputs, targets, w_t, w_i, w_f):
+        seq_fst = fromTransitions(w_t, w_i, w_f, transition_ids=self._transition_to_arc)
+
         device = inputs.device
         arc_scores = self.scores_to_arc(inputs)
         arc_labels = self.labels_to_arc(targets)
@@ -169,7 +158,7 @@ class LatticeCrf(torch.nn.Module):
             obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
             gt_fst = fromSequence(arc_labels[batch_index])
 
-            denom_fst = gtn.compose(obs_fst, self._seq_fst)
+            denom_fst = gtn.compose(obs_fst, seq_fst)
             num_fst = gtn.compose(denom_fst, gt_fst)
 
             loss = gtn.subtract(
@@ -182,18 +171,53 @@ class LatticeCrf(torch.nn.Module):
 
         gtn.parallel_for(seq_loss, range(batch_size))
 
+        self.auxiliary_data = (losses, seq_fst, arc_scores.shape)
+
         losses = torch.tensor([lp.item() for lp in losses]).to(device)
-        self.auxiliary_data = (losses, obs_fsts, arc_scores.shape)
 
         return losses
 
-    def _log_prob_gradient(self):
-        raise NotImplementedError()
+    def _log_prob_gradient(self, grad_output):
+        """
+        Parameters
+        ----------
+        grad_output
+
+        Returns
+        -------
+        input_grad
+        target_grad
+        transition_grad
+        """
+
+        losses, transition_fst, transition_shape = self.auxiliary_data
+        transition_grad = torch.empty(transition_shape)
+
+        # Compute the gradients for each example:
+        def seq_grad(b):
+            gtn.backward(losses[b])
+
+        # Compute gradients in parallel over the batch:
+        gtn.parallel_for(seq_grad, range(len(losses)))
+
+        # TODO: figure out how weights are ordered
+        transition_grad = transition_fst.grad().weights_to_numpy()
+        import pdb; pdb.set_trace()
+
+        input_grad = None
+        target_grad = None
+        transition_grad = torch.from_numpy(transition_grad).to(grad_output.device)
+
+        return input_grad, target_grad, transition_grad
 
     def predict(self, inputs):
         return self.argmax(inputs)
 
     def argmax(self, inputs):
+        seq_fst = fromTransitions(
+            self._params['transition'], self._params['initial'], self._params['final'],
+            transition_ids=self._transition_to_arc
+        )
         arc_scores = self.scores_to_arc(inputs)
 
         device = arc_scores.device
@@ -205,7 +229,7 @@ class LatticeCrf(torch.nn.Module):
 
         def pred_seq(batch_index):
             obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
-            denom_fst = gtn.compose(obs_fst, self._seq_fst)
+            denom_fst = gtn.compose(obs_fst, seq_fst)
             best_paths[batch_index] = gtn.viterbi_path(denom_fst)
 
         gtn.parallel_for(pred_seq, range(batch_size))
