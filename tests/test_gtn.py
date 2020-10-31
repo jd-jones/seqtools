@@ -4,6 +4,7 @@ import collections
 import yaml
 import numpy as np
 import torch
+import gtn
 
 from mathtools import utils, metrics, torchutils
 from seqtools import fstutils_gtn as libfst
@@ -87,9 +88,9 @@ def main(
     train_loader = data_loader
     val_loader = data_loader
 
-    transition_weights = torch.tensor(transition, dtype=torch.float)
-    initial_weights = torch.tensor(initial, dtype=torch.float)
-    final_weights = torch.tensor(final, dtype=torch.float)
+    transition_weights = torch.tensor(transition, dtype=torch.float).log()
+    initial_weights = torch.tensor(initial, dtype=torch.float).log()
+    final_weights = torch.tensor(final, dtype=torch.float).log()
 
     model = libfst.LatticeCrf(
         vocabulary,
@@ -97,6 +98,11 @@ def main(
         initial_weights=initial_weights, final_weights=final_weights,
         debug_output_dir=fig_dir,
         **model_kwargs
+    )
+
+    gtn.draw(
+        model._transition_fst, os.path.join(fig_dir, 'transitions-init.png'),
+        isymbols=model._arc_symbols, osymbols=model._arc_symbols
     )
 
     # Train the model
@@ -119,6 +125,12 @@ def main(
         train_epoch_log=train_epoch_log,
         val_epoch_log=val_epoch_log,
         num_epochs=num_epochs
+    )
+
+    model._transition_fst.set_weights(model._params['transition'].tolist())
+    gtn.draw(
+        model._transition_fst, os.path.join(fig_dir, 'transitions-trained.png'),
+        isymbols=model._arc_symbols, osymbols=model._arc_symbols
     )
 
     torchutils.plotEpochLog(

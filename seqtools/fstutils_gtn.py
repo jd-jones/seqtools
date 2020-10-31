@@ -88,19 +88,25 @@ class LatticeCrf(torch.nn.Module):
         if final_weights is None:
             final_weights = torch.zeros(self._vocab_size, dtype=torch.float)
 
-        self._params = torch.nn.ParameterDict({
-            'transition': torch.nn.Parameter(transition_weights, requires_grad=requires_grad),
-            'initial': torch.nn.Parameter(initial_weights, requires_grad=requires_grad),
-            'final': torch.nn.Parameter(final_weights, requires_grad=requires_grad)
-        })
-
         self._arc_to_transition, self._transition_to_arc = makeTransitionVocabulary(
             transition_weights
         )
+
         self._arc_symbols = {
             arc_idx: ','.join([str(self._vocabulary[state_idx]) for state_idx in state_pair])
             for arc_idx, state_pair in enumerate(self._arc_to_transition)
         }
+
+        self._transition_fst = fromTransitions(
+            transition_weights, initial_weights, final_weights,
+            transition_ids=self._transition_to_arc
+        )
+
+        transition_params = torch.from_numpy(self._transition_fst.weights_to_numpy())
+
+        self._params = torch.nn.ParameterDict({
+            'transition': torch.nn.Parameter(transition_params, requires_grad=requires_grad),
+        })
 
     def labels_to_arc(self, labels):
         arc_labels = torch.stack([
@@ -120,27 +126,27 @@ class LatticeCrf(torch.nn.Module):
         return arc_scores
 
     def nllLoss(self, inputs, targets):
-        return self.log_prob(inputs, targets)
+        # FIXME
+        return -self.log_prob(inputs, targets)
 
     def log_prob(self, inputs, targets):
         class GtnNllLoss(torch.autograd.Function):
             @staticmethod
-            def forward(ctx, inputs, targets, w_t, w_i, w_f):
-                losses = self._log_prob(inputs, targets, w_t, w_i, w_f)
+            def forward(ctx, inputs, targets, w_tx):
+                losses = self._log_prob(inputs, targets, w_tx)
                 return losses
 
             @staticmethod
             def backward(ctx, grad_output):
-                return self._log_prob_gradient(grad_output)
+                gradients = self._log_prob_gradient(grad_output)
+                return gradients
 
-        logprob = GtnNllLoss.apply(
-            inputs, targets,
-            self._params['transition'], self._params['initial'], self._params['final']
-        )
+        logprob = GtnNllLoss.apply(inputs, targets, self._params['transition'])
         return logprob
 
-    def _log_prob(self, inputs, targets, w_t, w_i, w_f):
-        seq_fst = fromTransitions(w_t, w_i, w_f, transition_ids=self._transition_to_arc)
+    def _log_prob(self, inputs, targets, transition_params):
+        self._transition_fst.set_weights(transition_params.tolist())
+        self._transition_fst.zero_grad()
 
         device = inputs.device
         arc_scores = self.scores_to_arc(inputs)
@@ -158,23 +164,19 @@ class LatticeCrf(torch.nn.Module):
             obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
             gt_fst = fromSequence(arc_labels[batch_index])
 
-            denom_fst = gtn.compose(obs_fst, seq_fst)
+            denom_fst = gtn.compose(obs_fst, self._transition_fst)
             num_fst = gtn.compose(denom_fst, gt_fst)
 
-            loss = gtn.subtract(
-                gtn.forward_score(num_fst),
-                gtn.forward_score(denom_fst)
-            )
+            loss = gtn.subtract(gtn.forward_score(num_fst), gtn.forward_score(denom_fst))
 
             losses[batch_index] = loss
             obs_fsts[batch_index] = obs_fst
 
         gtn.parallel_for(seq_loss, range(batch_size))
 
-        self.auxiliary_data = (losses, seq_fst, arc_scores.shape)
+        self.auxiliary_data = losses
 
         losses = torch.tensor([lp.item() for lp in losses]).to(device)
-
         return losses
 
     def _log_prob_gradient(self, grad_output):
@@ -190,8 +192,7 @@ class LatticeCrf(torch.nn.Module):
         transition_grad
         """
 
-        losses, transition_fst, transition_shape = self.auxiliary_data
-        transition_grad = torch.empty(transition_shape)
+        losses = self.auxiliary_data
 
         # Compute the gradients for each example:
         def seq_grad(b):
@@ -200,13 +201,11 @@ class LatticeCrf(torch.nn.Module):
         # Compute gradients in parallel over the batch:
         gtn.parallel_for(seq_grad, range(len(losses)))
 
-        # TODO: figure out how weights are ordered
-        transition_grad = transition_fst.grad().weights_to_numpy()
-        import pdb; pdb.set_trace()
+        transition_grad = self._transition_fst.grad().weights_to_numpy()
 
         input_grad = None
         target_grad = None
-        transition_grad = torch.from_numpy(transition_grad).to(grad_output.device)
+        transition_grad = torch.from_numpy(transition_grad) * grad_output.cpu()
 
         return input_grad, target_grad, transition_grad
 
@@ -214,10 +213,7 @@ class LatticeCrf(torch.nn.Module):
         return self.argmax(inputs)
 
     def argmax(self, inputs):
-        seq_fst = fromTransitions(
-            self._params['transition'], self._params['initial'], self._params['final'],
-            transition_ids=self._transition_to_arc
-        )
+        self._transition_fst.set_weights(self._params['transition'].tolist())
         arc_scores = self.scores_to_arc(inputs)
 
         device = arc_scores.device
@@ -229,7 +225,7 @@ class LatticeCrf(torch.nn.Module):
 
         def pred_seq(batch_index):
             obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
-            denom_fst = gtn.compose(obs_fst, seq_fst)
+            denom_fst = gtn.compose(obs_fst, self._transition_fst)
             best_paths[batch_index] = gtn.viterbi_path(denom_fst)
 
         gtn.parallel_for(pred_seq, range(batch_size))
