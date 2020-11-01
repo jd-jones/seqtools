@@ -24,6 +24,7 @@ def vocab_mapper(base=None):
     return mapper
 
 
+# Log-semiring constants
 zero = -np.inf
 one = 0
 
@@ -73,11 +74,13 @@ class LatticeCrf(torch.nn.Module):
     def __init__(
             self, vocabulary,
             transition_weights=None, initial_weights=None, final_weights=None,
+            duration_weights=None,
             requires_grad=True, debug_output_dir=None):
         super().__init__()
 
         self._vocabulary = vocabulary
         self._vocab_size = len(vocabulary)
+        self._vocab_symbols = vocab_mapper({i: symbol for i, symbol in enumerate(vocabulary)})
 
         if transition_weights is None:
             transition_weights = torch.zeros(self._vocab_size, self._vocab_size, dtype=torch.float)
@@ -88,24 +91,39 @@ class LatticeCrf(torch.nn.Module):
         if final_weights is None:
             final_weights = torch.zeros(self._vocab_size, dtype=torch.float)
 
+        if duration_weights is None:
+            duration_weights = torch.zeros(
+                self._vocab_size, self._vocab_size, 1,
+                dtype=torch.float
+            )
+
         self._arc_to_transition, self._transition_to_arc = makeTransitionVocabulary(
             transition_weights
         )
 
-        self._arc_symbols = {
-            arc_idx: ','.join([str(self._vocabulary[state_idx]) for state_idx in state_pair])
-            for arc_idx, state_pair in enumerate(self._arc_to_transition)
-        }
+        self._arc_symbols = vocab_mapper(
+            {
+                arc_idx: ','.join([self._vocab_symbols[state_idx] for state_idx in state_pair])
+                for arc_idx, state_pair in enumerate(self._arc_to_transition)
+            }
+        )
 
         self._transition_fst = fromTransitions(
-            transition_weights, initial_weights, final_weights,
+            transition_weights, init_weights=initial_weights, final_weights=final_weights,
+            transition_ids=self._transition_to_arc
+        )
+
+        self._duration_fst = fromDurations(
+            duration_weights, init_weights=None, final_weights=None,
             transition_ids=self._transition_to_arc
         )
 
         transition_params = torch.from_numpy(self._transition_fst.weights_to_numpy())
+        duration_params = torch.from_numpy(self._duration_fst.weights_to_numpy())
 
         self._params = torch.nn.ParameterDict({
             'transition': torch.nn.Parameter(transition_params, requires_grad=requires_grad),
+            'duration': torch.nn.Parameter(duration_params, requires_grad=requires_grad),
         })
 
     def labels_to_arc(self, labels):
@@ -125,15 +143,30 @@ class LatticeCrf(torch.nn.Module):
         ])
         return arc_scores
 
+    def seq_fst(self, transition_params=None, duration_params=None):
+        if transition_params is None:
+            transition_params = self._params['transition']
+
+        if duration_params is None:
+            duration_params = self._params['duration']
+
+        self._transition_fst.set_weights(transition_params.tolist())
+        self._transition_fst.zero_grad()
+
+        self._duration_fst.set_weights(duration_params.tolist())
+        self._duration_fst.zero_grad()
+
+        # seq_fst = gtn.compose(self._duration_fst, self._transition_fst)
+        return self._duration_fst, self._transition_fst
+
     def nllLoss(self, inputs, targets):
-        # FIXME
         return -self.log_prob(inputs, targets)
 
     def log_prob(self, inputs, targets):
         class GtnNllLoss(torch.autograd.Function):
             @staticmethod
-            def forward(ctx, inputs, targets, w_tx):
-                losses = self._log_prob(inputs, targets, w_tx)
+            def forward(ctx, inputs, targets, w_tx, w_dur):
+                losses = self._log_prob(inputs, targets, w_tx, w_dur)
                 return losses
 
             @staticmethod
@@ -141,12 +174,17 @@ class LatticeCrf(torch.nn.Module):
                 gradients = self._log_prob_gradient(grad_output)
                 return gradients
 
-        logprob = GtnNllLoss.apply(inputs, targets, self._params['transition'])
+        logprob = GtnNllLoss.apply(
+            inputs, targets,
+            self._params['transition'], self._params['duration']
+        )
         return logprob
 
-    def _log_prob(self, inputs, targets, transition_params):
-        self._transition_fst.set_weights(transition_params.tolist())
-        self._transition_fst.zero_grad()
+    def _log_prob(self, inputs, targets, transition_params, duration_params):
+        seq_fsts = self.seq_fst(
+            transition_params=transition_params,
+            duration_params=duration_params
+        )
 
         device = inputs.device
         arc_scores = self.scores_to_arc(inputs)
@@ -164,7 +202,13 @@ class LatticeCrf(torch.nn.Module):
             obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
             gt_fst = fromSequence(arc_labels[batch_index])
 
-            denom_fst = gtn.compose(obs_fst, self._transition_fst)
+            # Compose each sequence fst individually: it seems like composition
+            # only works for lattices
+            denom_fst = obs_fst
+            for seq_fst in seq_fsts:
+                denom_fst = gtn.compose(denom_fst, seq_fst)
+                denom_fst = gtn.project_output(denom_fst)
+
             num_fst = gtn.compose(denom_fst, gt_fst)
 
             loss = gtn.subtract(gtn.forward_score(num_fst), gtn.forward_score(denom_fst))
@@ -177,6 +221,7 @@ class LatticeCrf(torch.nn.Module):
         self.auxiliary_data = losses
 
         losses = torch.tensor([lp.item() for lp in losses]).to(device)
+
         return losses
 
     def _log_prob_gradient(self, grad_output):
@@ -202,18 +247,21 @@ class LatticeCrf(torch.nn.Module):
         gtn.parallel_for(seq_grad, range(len(losses)))
 
         transition_grad = self._transition_fst.grad().weights_to_numpy()
+        duration_grad = self._duration_fst.grad().weights_to_numpy()
 
         input_grad = None
         target_grad = None
         transition_grad = torch.from_numpy(transition_grad) * grad_output.cpu()
+        duration_grad = torch.from_numpy(duration_grad) * grad_output.cpu()
 
-        return input_grad, target_grad, transition_grad
+        return input_grad, target_grad, transition_grad, duration_grad
 
     def predict(self, inputs):
         return self.argmax(inputs)
 
     def argmax(self, inputs):
-        self._transition_fst.set_weights(self._params['transition'].tolist())
+        seq_fsts = self.seq_fst()
+
         arc_scores = self.scores_to_arc(inputs)
 
         device = arc_scores.device
@@ -225,8 +273,15 @@ class LatticeCrf(torch.nn.Module):
 
         def pred_seq(batch_index):
             obs_fst = linearFstFromArray(arc_scores[batch_index].reshape(num_samples, -1))
-            denom_fst = gtn.compose(obs_fst, self._transition_fst)
-            best_paths[batch_index] = gtn.viterbi_path(denom_fst)
+
+            # Compose each sequence fst individually: it seems like composition
+            # only works for lattices
+            denom_fst = obs_fst
+            for seq_fst in seq_fsts:
+                denom_fst = gtn.compose(denom_fst, seq_fst)
+
+            viterbi_path = gtn.viterbi_path(denom_fst)
+            best_paths[batch_index] = gtn.remove(gtn.project_output(viterbi_path))
 
         gtn.parallel_for(pred_seq, range(batch_size))
 
@@ -244,25 +299,6 @@ class LatticeCrf(torch.nn.Module):
         return outputs
 
 
-class DurationCrf(LatticeCrf):
-    def __init__(self, labels, num_states=2, transition_weights=None, self_weights=None):
-        super().__init__()
-
-        if transition_weights is None:
-            transition_weights = [0.6] * num_states
-
-        if self_weights is None:
-            self_weights = [0.4] * num_states
-
-        self._transition_weights = transition_weights
-        self._self_weights = self_weights
-        self._num_states = num_states
-        self._labels = labels
-
-    def _makeSeqFst(self):
-        raise NotImplementedError()
-
-
 # -=( MISC UTILS )==-----------------------------------------------------------
 def toTransitionSeq(state_seq):
     transition_seq = (
@@ -278,9 +314,25 @@ def toStateSeq(transition_seq):
     return state_seq
 
 
-# -=( CREATION AND CONVERSION )==----------------------------------------------
+def makeTransitionVocabulary(transition_weights):
+    num_states = transition_weights.shape[0]
+
+    transition_vocab = []
+    for s_cur in range(num_states):
+        for s_next in range(num_states):
+            transition_vocab.append((s_cur, s_next))
+    for s in range(num_states):
+        transition_vocab.append((BOS, s))
+    for s in range(num_states):
+        transition_vocab.append((s, EOS))
+
+    transition_ids = {t: i for i, t in enumerate(transition_vocab)}
+
+    return transition_vocab, transition_ids
+
+
+# -=( FST CREATION )==---------------------------------------------------------
 def linearFstFromArray(weights):
-    # Create a linear FST
     seq_len, vocab_size = weights.shape
     fst = gtn.linear_graph(seq_len, vocab_size, calc_grad=weights.requires_grad)
 
@@ -288,83 +340,7 @@ def linearFstFromArray(weights):
     data = weights.contiguous()
     fst.set_weights(data.data_ptr())
 
-    return fst
-
-
-def fromArray(weights, final_weight=None, calc_grad=True):
-    """ Instantiate a state machine from an array of weights.
-
-    Parameters
-    ----------
-    weights : array_like, shape (num_inputs, num_outputs)
-        Needs to implement `.shape`, so it should be a numpy array or a torch
-        tensor.
-    final_weight : arc_types.AbstractSemiringWeight, optional
-        Should have the same type as `arc_type`. Default is `arc_type.zero`
-
-    Returns
-    -------
-    fst : fsm.FST
-        The transducer's arcs have input labels corresponding to the state
-        they left, and output labels corresponding to the state they entered.
-    """
-    if weights.ndim == 3:
-        is_lattice = False
-    elif weights.ndim == 2:
-        is_lattice = True
-    else:
-        raise AssertionError(f"weights have unrecognized shape {weights.shape}")
-
-    fst = gtn.Graph(calc_grad=calc_grad)
-
-    if final_weight is None:
-        final_weight = one
-
-    init_state = fst.add_node(start=True)
-    final_state = fst.add_node(accept=True)
-
-    if is_lattice:
-        prev_state = init_state
-        for sample_index, row in enumerate(weights):
-            cur_state = fst.add_node()
-            for i, weight in enumerate(row):
-                input_label_index = sample_index
-                output_label_index = i
-                if weight != zero:
-                    fst.add_arc(
-                        prev_state, cur_state,
-                        input_label_index, output_label_index,
-                        weight
-                    )
-            prev_state = cur_state
-        if final_weight != zero:
-            fst.add_arc(
-                cur_state, final_state,
-                gtn.epsilon, gtn.epsilon,
-                final_weight
-            )
-    else:
-        prev_state = init_state
-        for sample_index, input_output in enumerate(weights):
-            cur_state = fst.add_node()
-            for i, outputs in enumerate(input_output):
-                for j, weight in enumerate(outputs):
-                    input_label_index = i
-                    output_label_index = j
-                    if weight != zero:
-                        fst.add_arc(
-                            prev_state, cur_state,
-                            input_label_index, output_label_index,
-                            weight
-                        )
-            prev_state = cur_state
-        if final_weight != zero:
-            fst.add_arc(
-                cur_state, final_state,
-                gtn.epsilon, gtn.epsilon,
-                final_weight
-            )
-
+    fst.arc_sort(olabel=True)
     return fst
 
 
@@ -384,36 +360,46 @@ def fromSequence(seq, is_acceptor=True, calc_grad=True):
         prev_state = cur_state
     fst.add_arc(cur_state, final_state, gtn.epsilon)
 
+    fst.arc_sort(olabel=True)
     return fst
 
 
-def toArray(lattice):
-    num_states = lattice.num_states()
-    num_outputs = lattice.output_symbols().num_symbols()
-    weights = np.full((num_states, num_outputs), float(zero))
+def fromDurations(
+        duration_weights, init_weights=None, final_weights=None,
+        transition_ids=None, calc_grad=True):
+    if init_weights is None:
+        init_weights = np.full(duration_weights.shape[:-1], one)
 
-    for state in lattice.states():
-        for arc in lattice.arcs(state):
-            weights[state, arc.olabel] = float(arc.weight)
+    if final_weights is None:
+        final_weights = np.full(duration_weights.shape[:-1], one)
 
-    return weights, lattice.weight_type()
+    fst = gtn.Graph(calc_grad=calc_grad)
+    init_state = fst.add_node(start=True)
+    final_state = fst.add_node(accept=True)
+    fst.add_arc(final_state, init_state, gtn.epsilon, gtn.epsilon, one)
 
+    def makeStateDuration(i_cur, i_next):
+        weights = duration_weights[i_cur, i_next]
+        transition_id = transition_ids[i_cur, i_next]
+        init_weight = init_weights[i_cur, i_next]
+        final_weight = final_weights[i_cur, i_next]
 
-def makeTransitionVocabulary(transition_weights):
-    num_states = transition_weights.shape[0]
+        cur_state = fst.add_node()
+        fst.add_arc(init_state, cur_state, gtn.epsilon, transition_id, init_weight)
 
-    transition_vocab = []
-    for s_cur in range(num_states):
-        for s_next in range(num_states):
-            transition_vocab.append((s_cur, s_next))
-    for s in range(num_states):
-        transition_vocab.append((BOS, s))
-    for s in range(num_states):
-        transition_vocab.append((s, EOS))
+        for weight in weights:
+            next_state = fst.add_node()
+            fst.add_arc(cur_state, next_state, transition_id, gtn.epsilon, weight)
+            cur_state = next_state
+        fst.add_arc(cur_state, final_state, gtn.epsilon, gtn.epsilon, final_weight)
 
-    transition_ids = {t: i for i, t in enumerate(transition_vocab)}
+    num_states = duration_weights.shape[0]
+    for i_cur in range(num_states):
+        for i_next in range(num_states):
+            makeStateDuration(i_cur, i_next)
 
-    return transition_vocab, transition_ids
+    fst.arc_sort(olabel=True)
+    return fst
 
 
 def fromTransitions(
@@ -467,8 +453,5 @@ def fromTransitions(
             if weight != zero:
                 fst.add_arc(cur_state, next_state, transition_id, transition_id, weight)
 
+    fst.arc_sort(olabel=True)
     return fst
-
-
-def viterbi(fst):
-    raise NotImplementedError()
