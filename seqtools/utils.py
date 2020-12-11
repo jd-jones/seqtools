@@ -56,13 +56,17 @@ def smoothCounts(
         initial_counts = (initial_counts > 0).astype(float)
         final_counts = (final_counts > 0).astype(float)
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='divide by zero')
-        denominator = bigram_counts.sum(1)
-        transition_probs = bigram_counts / denominator[:, None]
-        transition_probs[np.isnan(transition_probs)] = 0
-    # FIXME: these aren't the real final probs in general
-    final_probs = (final_counts > 0).astype(float)
+    denominator = bigram_counts.sum(1)
+    transition_probs = np.divide(
+        bigram_counts, denominator[:, None],
+        out=np.zeros_like(bigram_counts),
+        where=denominator[:, None] != 0
+    )
+    final_probs = np.divide(
+        final_counts, denominator,
+        out=np.zeros_like(final_counts),
+        where=denominator != 0
+    )
     initial_probs = initial_counts / initial_counts.sum()
 
     if as_numpy:
