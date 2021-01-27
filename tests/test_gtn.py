@@ -122,7 +122,7 @@ def main(
             d1_fst = gtn.compose(obs_fst, model._duration_fst)
             d1_fst = gtn.project_output(d1_fst)
             denom_fst = gtn.compose(d1_fst, model._transition_fst)
-            denom_fst = gtn.project_output(denom_fst)
+            # denom_fst = gtn.project_output(denom_fst)
             num_fst = gtn.compose(denom_fst, gt_fst)
             viterbi_fst = gtn.viterbi_path(denom_fst)
             pred_fst = gtn.remove(gtn.project_output(viterbi_fst))
