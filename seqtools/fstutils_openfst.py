@@ -290,6 +290,14 @@ def easyUnion(*fsts, disambiguate=False):
 
 
 # -=( CREATION AND CONVERSION )==----------------------------------------------
+def makeSymbolTable(vocabulary):
+    symbol_table = openfst.SymbolTable()
+    symbol_table.add_symbol(EPSILON_STRING, key=EPSILON)
+    for index, symbol in enumerate(vocabulary, start=1):
+        symbol_table.add_symbol(str(symbol), key=index)
+    return symbol_table
+
+
 def fromArray(weights, final_weight=None, arc_type=None, input_labels=None, output_labels=None):
     """ Instantiate a state machine from an array of weights.
 
@@ -390,8 +398,7 @@ def fromArray(weights, final_weight=None, arc_type=None, input_labels=None, outp
         fst.set_final(cur_state, final_weight)
 
     if not fst.verify():
-        # raise openfst.FstError("fst.verify() returned False")
-        print("fst.verify() returned False")
+        raise openfst.FstError("fst.verify() returned False")
 
     return fst
 
