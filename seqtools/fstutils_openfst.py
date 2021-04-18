@@ -197,7 +197,7 @@ class DurationCrf(LatticeCrf):
             for label in self._labels
         ]
 
-        dur_fst = dur_fsts[0].union(dur_fsts[1:]).closure(closure_plus=True)
+        dur_fst = dur_fsts[0].union(*dur_fsts[1:]).closure(closure_plus=True)
 
         return dur_fst
 
@@ -245,6 +245,29 @@ def outputLabels(fst):
         yield tuple(arc.olabel for arc in path)
 
 
+def getLabels(fst, label_type='output'):
+    for path in iteratePaths(fst):
+        if label_type == 'output':
+            yield tuple(arc.olabel for arc in path)
+        elif label_type == 'input':
+            yield tuple(arc.ilabel for arc in path)
+        else:
+            raise AssertionError()
+
+
+def easyCompose(*fsts, determinize=True, minimize=True):
+    composed = fsts[0]
+    for fst in fsts[1:]:
+        composed = openfst.compose(composed, fst)
+        if determinize:
+            composed = openfst.determinize(composed)
+
+    if minimize:
+        composed.minimize()
+
+    return composed
+
+
 def easyUnion(*fsts, disambiguate=False):
     union_fst = openfst.VectorFst(arc_type=fsts[0].arc_type())
     union_fst.set_start(union_fst.add_state())
@@ -290,15 +313,25 @@ def easyUnion(*fsts, disambiguate=False):
 
 
 # -=( CREATION AND CONVERSION )==----------------------------------------------
-def makeSymbolTable(vocabulary):
+def makeSymbolTable(vocabulary, prepend_epsilon=True):
     symbol_table = openfst.SymbolTable()
-    symbol_table.add_symbol(EPSILON_STRING, key=EPSILON)
-    for index, symbol in enumerate(vocabulary, start=1):
+
+    if prepend_epsilon:
+        symbol_table.add_symbol(EPSILON_STRING, key=EPSILON)
+        start = 1
+    else:
+        start = 0
+
+    for index, symbol in enumerate(vocabulary, start=start):
         symbol_table.add_symbol(str(symbol), key=index)
+
     return symbol_table
 
 
-def fromArray(weights, final_weight=None, arc_type=None, input_labels=None, output_labels=None):
+def fromArray(
+        weights, final_weight=None, arc_type=None,
+        # input_labels=None, output_labels=None
+        input_symbols=None, output_symbols=None):
     """ Instantiate a state machine from an array of weights.
 
     Parameters
@@ -329,6 +362,7 @@ def fromArray(weights, final_weight=None, arc_type=None, input_labels=None, outp
     if arc_type is None:
         arc_type = 'standard'
 
+    """
     if output_labels is None:
         output_labels = {str(i): i for i in range(weights.shape[1])}
 
@@ -347,10 +381,11 @@ def fromArray(weights, final_weight=None, arc_type=None, input_labels=None, outp
     output_table.add_symbol(EPSILON_STRING, key=EPSILON)
     for out_symbol, index in output_labels.items():
         output_table.add_symbol(str(out_symbol), key=index + 1)
+    """
 
     fst = openfst.VectorFst(arc_type=arc_type)
-    fst.set_input_symbols(input_table)
-    fst.set_output_symbols(output_table)
+    fst.set_input_symbols(input_symbols)
+    fst.set_output_symbols(output_symbols)
 
     zero = openfst.Weight.zero(fst.weight_type())
     one = openfst.Weight.one(fst.weight_type())
@@ -518,8 +553,8 @@ def fromTransitions(
                 fst.add_arc(cur_state, arc)
 
     if not fst.verify():
-        # raise openfst.FstError("fst.verify() returned False")
-        print("fst.verify() returned False")
+        raise openfst.FstError("fst.verify() returned False")
+        # print("fst.verify() returned False")
 
     return fst
 
@@ -796,9 +831,17 @@ def viterbi(lattice):
     if lattice.arc_type() != 'standard':
         lattice = openfst.arcmap(lattice, map_type='to_std')
 
-    shortest_paths = openfst.shortestpath(lattice)
+    shortest_paths = (
+        openfst.shortestpath(lattice)
+        .topsort()
+        # .project('output')
+        .rmepsilon()
+        # .minimize()
+    )
 
-    path_outputs = outputLabels(shortest_paths)
+    import pdb; pdb.set_trace()
+
+    path_outputs = tuple(outputLabels(shortest_paths))
     if len(path_outputs) != 1:
         raise AssertionError()
     output = path_outputs[0]
