@@ -831,21 +831,9 @@ def viterbi(lattice):
     if lattice.arc_type() != 'standard':
         lattice = openfst.arcmap(lattice, map_type='to_std')
 
-    shortest_paths = (
-        openfst.shortestpath(lattice)
-        .topsort()
-        # .project('output')
-        .rmepsilon()
-        # .minimize()
-    )
+    shortest_paths = openfst.shortestpath(lattice).topsort().rmepsilon()
 
-    import pdb; pdb.set_trace()
-
-    path_outputs = tuple(outputLabels(shortest_paths))
-    if len(path_outputs) != 1:
-        raise AssertionError()
-    output = path_outputs[0]
-    return output
+    return shortest_paths
 
 
 def align(scores, label_seq):
