@@ -1,4 +1,4 @@
-setuptools==41.4.0
+setuptools==65.5.1
 joblib==0.13.2
 ipython==7.9.0
 numpy==1.17.2
